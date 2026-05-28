@@ -1,0 +1,32 @@
+##### 不要上传完整 vitis 或 vivado 目录 #####
+##### vivado仅同步 *.bd, *.xdc, *xsa
+##### vitis仅同步 src/
+
+# ide configs
+.vscode/
+.idea/
+
+# local
+*.obj
+*.pdb
+*.ilk
+*.o
+*.d
+/build/
+
+# logs
+logs/
+.log
+**/Debug/
+
+# caches
+__pycache__/
+*.py[cod]
+
+# agent configs
+claude.md
+AGENT.md
+.ai/
+.copilot/
+.gemini/
+.cursor/
