@@ -81,12 +81,34 @@ def assert_error_code(event: dict, code: str, request_id: str) -> None:
     assert event["payload"]["retryable"] is False
 
 
+def assert_status_update(
+    event: dict,
+    *,
+    stage: str,
+    state: str,
+    request_id: str,
+    session_id: str,
+) -> None:
+    assert event["type"] == "status.update"
+    assert event["request_id"] == request_id
+    assert event["session_id"] == session_id
+    assert event["payload"] == {"stage": stage, "state": state}
+
+
 def receive_until_type(websocket, event_type: str, *, limit: int = 6) -> dict:
     for _ in range(limit):
         event = websocket.receive_json()
         if event["type"] == event_type:
             return event
     raise AssertionError(f"Did not receive {event_type!r} within {limit} events")
+
+
+def receive_until_request_id(websocket, request_id: str, *, limit: int = 6) -> dict:
+    for _ in range(limit):
+        event = websocket.receive_json()
+        if event.get("request_id") == request_id:
+            return event
+    raise AssertionError(f"Did not receive request_id {request_id!r} within {limit} events")
 
 
 @pytest.mark.parametrize(
@@ -112,6 +134,7 @@ def receive_until_type(websocket, event_type: str, *, limit: int = 6) -> dict:
         ),
         ("client.tts.started", {"response_id": "rsp_001"}),
         ("client.tts.finished", {"response_id": "rsp_001"}),
+        ("heartbeat", {"uptime_ms": 100}),
     ],
 )
 def test_post_init_events_before_ready_return_session_not_ready(
@@ -150,6 +173,9 @@ def test_post_init_events_before_ready_return_session_not_ready(
         ),
         ("client.tts.started", {"response_id": "rsp_001"}),
         ("client.tts.finished", {"response_id": "rsp_001"}),
+        ("heartbeat", {"uptime_ms": 100}),
+        ("client.command", {"command": "unsupported.command"}),
+        ("conversation.interrupt", {"reason": "user_speaking_again"}),
     ],
 )
 def test_post_init_events_with_stale_session_id_return_invalid_message(
@@ -173,6 +199,41 @@ def test_post_init_events_with_stale_session_id_return_invalid_message(
     assert event["payload"]["field"] == "session_id"
 
 
+def test_ready_events_missing_session_id_return_invalid_message() -> None:
+    with client.websocket_connect("/api/v1/pet/ws") as websocket:
+        init_session(websocket)
+
+        websocket.send_text(
+            envelope(
+                "heartbeat",
+                {"uptime_ms": 100},
+                request_id="req_missing_session",
+            )
+        )
+        event = websocket.receive_json()
+
+    assert_error_code(event, "INVALID_MESSAGE", "req_missing_session")
+    assert event["payload"]["field"] == "session_id"
+
+
+def test_session_init_after_ready_returns_invalid_message() -> None:
+    with client.websocket_connect("/api/v1/pet/ws") as websocket:
+        ready = init_session(websocket)
+
+        websocket.send_text(
+            envelope(
+                "session.init",
+                {"device_id": "pynq-pet-001"},
+                request_id="req_reinit",
+                session_id=ready["session_id"],
+            )
+        )
+        event = websocket.receive_json()
+
+    assert_error_code(event, "INVALID_MESSAGE", "req_reinit")
+    assert event["payload"]["field"] == "type"
+
+
 def test_session_init_uses_default_config_and_reports_ready_capabilities() -> None:
     with client.websocket_connect("/api/v1/pet/ws") as websocket:
         event = init_session(websocket)
@@ -192,6 +253,16 @@ def test_session_init_uses_default_config_and_reports_ready_capabilities() -> No
             "behavior_planning": False,
         },
     }
+
+
+def test_heartbeat_before_ready_returns_session_not_ready() -> None:
+    with client.websocket_connect("/api/v1/pet/ws") as websocket:
+        websocket.send_text(
+            envelope("heartbeat", {"uptime_ms": 100}, request_id="req_heartbeat")
+        )
+        event = websocket.receive_json()
+
+    assert_error_code(event, "SESSION_NOT_READY", "req_heartbeat")
 
 
 def test_heartbeat_ack_includes_ready_session_id() -> None:
@@ -227,12 +298,22 @@ def test_text_input_after_ready_sends_response_sequence() -> None:
             )
         )
         events = [websocket.receive_json() for _ in range(4)]
+        websocket.send_text(
+            envelope(
+                "heartbeat",
+                {"uptime_ms": 100},
+                request_id="req_probe_after_text",
+                session_id=ready["session_id"],
+            )
+        )
+        events.append(websocket.receive_json())
 
     assert [event["type"] for event in events] == [
         "conversation.started",
         "status.update",
         "response.text",
         "response.complete",
+        "status.update",
     ]
     assert all(event["session_id"] == ready["session_id"] for event in events)
     turn_id = events[0]["payload"]["turn_id"]
@@ -240,7 +321,7 @@ def test_text_input_after_ready_sends_response_sequence() -> None:
     assert turn_id.startswith("turn_")
     assert response_id.startswith("rsp_")
     assert events[0]["payload"] == {"turn_id": turn_id, "trigger": "text"}
-    assert events[1]["payload"] == {"stage": "thinking"}
+    assert events[1]["payload"] == {"stage": "thinking", "state": "processing"}
     assert events[2]["payload"] == {
         "response_id": response_id,
         "turn_id": turn_id,
@@ -248,6 +329,10 @@ def test_text_input_after_ready_sends_response_sequence() -> None:
         "voice": "normal",
     }
     assert events[3]["payload"] == {"response_id": response_id, "turn_id": turn_id}
+    assert events[4]["payload"] == {
+        "stage": "waiting_client_playback",
+        "state": "waiting_client_playback",
+    }
 
 
 def test_text_input_before_ready_returns_session_not_ready_error() -> None:
@@ -279,10 +364,82 @@ def test_audio_chunk_after_ready_returns_audio_received_status() -> None:
         )
         event = websocket.receive_json()
 
-    assert event["type"] == "status.update"
-    assert event["request_id"] == "req_audio"
-    assert event["session_id"] == ready["session_id"]
-    assert event["payload"] == {"stage": "audio_received"}
+    assert_status_update(
+        event,
+        stage="audio_received",
+        state="listening",
+        request_id="req_audio",
+        session_id=ready["session_id"],
+    )
+
+
+def test_audio_chunk_enters_listening_without_starting_conversation() -> None:
+    with client.websocket_connect("/api/v1/pet/ws") as websocket:
+        ready = init_session(websocket)
+
+        websocket.send_text(
+            envelope(
+                "audio.chunk",
+                audio_chunk(1),
+                request_id="req_audio",
+                session_id=ready["session_id"],
+            )
+        )
+        assert_status_update(
+            websocket.receive_json(),
+            stage="audio_received",
+            state="listening",
+            request_id="req_audio",
+            session_id=ready["session_id"],
+        )
+
+        websocket.send_text(
+            envelope(
+                "heartbeat",
+                {"uptime_ms": 100},
+                request_id="req_after_audio",
+                session_id=ready["session_id"],
+            )
+        )
+        event = websocket.receive_json()
+
+    assert event["type"] == "heartbeat.ack"
+    assert event["request_id"] == "req_after_audio"
+
+
+def test_text_input_from_listening_starts_turn() -> None:
+    with client.websocket_connect("/api/v1/pet/ws") as websocket:
+        ready = init_session(websocket)
+
+        websocket.send_text(
+            envelope(
+                "audio.chunk",
+                audio_chunk(1),
+                request_id="req_audio",
+                session_id=ready["session_id"],
+            )
+        )
+        assert_status_update(
+            websocket.receive_json(),
+            stage="audio_received",
+            state="listening",
+            request_id="req_audio",
+            session_id=ready["session_id"],
+        )
+
+        websocket.send_text(
+            envelope(
+                "text.input",
+                {"text": "从监听进入对话"},
+                request_id="req_text_from_listening",
+                session_id=ready["session_id"],
+            )
+        )
+        event = websocket.receive_json()
+
+    assert event["type"] == "conversation.started"
+    assert event["request_id"] == "req_text_from_listening"
+    assert event["payload"]["trigger"] == "text"
 
 
 def test_audio_chunk_with_invalid_format_returns_audio_format_unsupported() -> None:
@@ -314,7 +471,10 @@ def test_audio_chunk_seq_must_increase() -> None:
                 session_id=ready["session_id"],
             )
         )
-        assert websocket.receive_json()["payload"] == {"stage": "audio_received"}
+        assert websocket.receive_json()["payload"] == {
+            "stage": "audio_received",
+            "state": "listening",
+        }
 
         websocket.send_text(
             envelope(
@@ -445,7 +605,7 @@ def test_second_text_input_while_turn_active_returns_turn_already_active() -> No
                 session_id=ready["session_id"],
             )
         )
-        event = websocket.receive_json()
+        event = receive_until_type(websocket, "error", limit=3)
 
     assert_error_code(event, "TURN_ALREADY_ACTIVE", "req_second_text")
 
@@ -464,10 +624,13 @@ def test_image_upload_after_ready_returns_image_received_status() -> None:
         )
         event = websocket.receive_json()
 
-    assert event["type"] == "status.update"
-    assert event["request_id"] == "req_image"
-    assert event["session_id"] == ready["session_id"]
-    assert event["payload"] == {"stage": "image_received"}
+    assert_status_update(
+        event,
+        stage="image_received",
+        state="ready",
+        request_id="req_image",
+        session_id=ready["session_id"],
+    )
 
 
 def test_oversized_image_upload_returns_image_too_large() -> None:
@@ -616,10 +779,13 @@ def test_sensor_report_returns_sensor_received_without_starting_conversation() -
         )
         event = websocket.receive_json()
 
-    assert event["type"] == "status.update"
-    assert event["request_id"] == "req_sensor"
-    assert event["session_id"] == ready["session_id"]
-    assert event["payload"] == {"stage": "sensor_received"}
+    assert_status_update(
+        event,
+        stage="sensor_received",
+        state="ready",
+        request_id="req_sensor",
+        session_id=ready["session_id"],
+    )
 
 
 def test_behavior_event_returns_behavior_event_received_status() -> None:
@@ -642,10 +808,13 @@ def test_behavior_event_returns_behavior_event_received_status() -> None:
         )
         event = websocket.receive_json()
 
-    assert event["type"] == "status.update"
-    assert event["request_id"] == "req_behavior"
-    assert event["session_id"] == ready["session_id"]
-    assert event["payload"] == {"stage": "behavior_event_received"}
+    assert_status_update(
+        event,
+        stage="behavior_event_received",
+        state="ready",
+        request_id="req_behavior",
+        session_id=ready["session_id"],
+    )
 
 
 def test_unsupported_client_command_returns_invalid_client_command() -> None:
@@ -739,14 +908,20 @@ def test_client_tts_lifecycle_returns_status_updates() -> None:
         )
         finished = websocket.receive_json()
 
-    assert started["type"] == "status.update"
-    assert started["request_id"] == "req_tts_started"
-    assert started["session_id"] == ready["session_id"]
-    assert started["payload"] == {"stage": "client_tts_started"}
-    assert finished["type"] == "status.update"
-    assert finished["request_id"] == "req_tts_finished"
-    assert finished["session_id"] == ready["session_id"]
-    assert finished["payload"] == {"stage": "client_tts_finished"}
+    assert_status_update(
+        started,
+        stage="client_tts_started",
+        state="waiting_client_playback",
+        request_id="req_tts_started",
+        session_id=ready["session_id"],
+    )
+    assert_status_update(
+        finished,
+        stage="client_tts_finished",
+        state="idle",
+        request_id="req_tts_finished",
+        session_id=ready["session_id"],
+    )
 
 
 def test_client_tts_finished_clears_active_turn() -> None:
@@ -772,7 +947,10 @@ def test_client_tts_finished_clears_active_turn() -> None:
                 session_id=ready["session_id"],
             )
         )
-        assert websocket.receive_json()["payload"] == {"stage": "client_tts_finished"}
+        assert receive_until_request_id(websocket, "req_finish_turn")["payload"] == {
+            "stage": "client_tts_finished",
+            "state": "idle",
+        }
 
         websocket.send_text(
             envelope(
@@ -789,6 +967,48 @@ def test_client_tts_finished_clears_active_turn() -> None:
         "INTERRUPT_WITHOUT_ACTIVE_TURN",
         "req_interrupt_after_finished",
     )
+
+
+def test_client_tts_finished_allows_new_text_input_from_idle() -> None:
+    with client.websocket_connect("/api/v1/pet/ws") as websocket:
+        ready = init_session(websocket)
+
+        websocket.send_text(
+            envelope(
+                "text.input",
+                {"text": "第一句"},
+                request_id="req_first_text",
+                session_id=ready["session_id"],
+            )
+        )
+        for _ in range(4):
+            websocket.receive_json()
+
+        websocket.send_text(
+            envelope(
+                "client.tts.finished",
+                {"response_id": "rsp_001"},
+                request_id="req_finish_turn",
+                session_id=ready["session_id"],
+            )
+        )
+        assert receive_until_request_id(websocket, "req_finish_turn")["payload"] == {
+            "stage": "client_tts_finished",
+            "state": "idle",
+        }
+
+        websocket.send_text(
+            envelope(
+                "text.input",
+                {"text": "第二句"},
+                request_id="req_second_text",
+                session_id=ready["session_id"],
+            )
+        )
+        event = receive_until_type(websocket, "conversation.started", limit=3)
+
+    assert event["type"] == "conversation.started"
+    assert event["request_id"] == "req_second_text"
 
 
 def test_session_close_returns_session_closed_then_closes_connection() -> None:
@@ -813,6 +1033,36 @@ def test_session_close_returns_session_closed_then_closes_connection() -> None:
             websocket.receive_json()
 
 
+def test_session_close_with_stale_session_id_returns_error_and_stays_open() -> None:
+    with client.websocket_connect("/api/v1/pet/ws") as websocket:
+        ready = init_session(websocket)
+
+        websocket.send_text(
+            envelope(
+                "session.close",
+                {"reason": "client_shutdown"},
+                request_id="req_close_stale",
+                session_id="ses_stale",
+            )
+        )
+        error = websocket.receive_json()
+
+        websocket.send_text(
+            envelope(
+                "heartbeat",
+                {"uptime_ms": 100},
+                request_id="req_after_stale_close",
+                session_id=ready["session_id"],
+            )
+        )
+        ack = websocket.receive_json()
+
+    assert_error_code(error, "INVALID_MESSAGE", "req_close_stale")
+    assert error["payload"]["field"] == "session_id"
+    assert ack["type"] == "heartbeat.ack"
+    assert ack["request_id"] == "req_after_stale_close"
+
+
 def test_unsupported_version_returns_error_and_keeps_connection_open() -> None:
     with client.websocket_connect("/api/v1/pet/ws") as websocket:
         websocket.send_text(
@@ -820,7 +1070,15 @@ def test_unsupported_version_returns_error_and_keeps_connection_open() -> None:
         )
         error = websocket.receive_json()
 
-        websocket.send_text(envelope("heartbeat", {}, request_id="req_heartbeat"))
+        ready = init_session(websocket)
+        websocket.send_text(
+            envelope(
+                "heartbeat",
+                {},
+                request_id="req_heartbeat",
+                session_id=ready["session_id"],
+            )
+        )
         ack = websocket.receive_json()
 
     assert error["type"] == "error"

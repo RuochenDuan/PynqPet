@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import binascii
 from dataclasses import dataclass
+from enum import StrEnum
 from json import JSONDecodeError
 from typing import Any
 from uuid import uuid4
@@ -18,6 +19,7 @@ from pynq_pet_gateway.protocol import (
     build_event,
     parse_envelope,
 )
+from pynq_pet_gateway.upstream import PlaceholderUpstreamAdapter, UpstreamAdapter
 
 
 router = APIRouter()
@@ -31,12 +33,23 @@ MAX_IMAGE_HEIGHT = 240
 SUPPORTED_IMAGE_MIME_TYPES = {"image/jpeg", "image/png"}
 
 
+class SessionState(StrEnum):
+    CONNECTED = "connected"
+    READY = "ready"
+    LISTENING = "listening"
+    PROCESSING = "processing"
+    RESPONDING = "responding"
+    WAITING_CLIENT_PLAYBACK = "waiting_client_playback"
+    IDLE = "idle"
+    CLOSING = "closing"
+
+
 @dataclass
 class PetSession:
+    state: SessionState = SessionState.CONNECTED
     session_id: str | None = None
     device_id: str | None = None
     config_id: str | None = None
-    ready: bool = False
     last_audio_seq: int | None = None
     latest_image: dict[str, Any] | None = None
     latest_sensor: dict[str, Any] | None = None
@@ -44,16 +57,24 @@ class PetSession:
     behavior_event_count: int = 0
     active_turn_id: str | None = None
 
+    def is_initialized(self) -> bool:
+        return self.session_id is not None and self.state != SessionState.CONNECTED
+
+    def transition_to(self, state: SessionState) -> None:
+        self.state = state
+
 
 @router.websocket("/api/v1/pet/ws")
 async def pet_ws(websocket: WebSocket) -> None:
     await websocket.accept()
     session = PetSession()
+    upstream = PlaceholderUpstreamAdapter()
 
     while True:
         try:
             raw = await websocket.receive_text()
         except WebSocketDisconnect:
+            session.transition_to(SessionState.CLOSING)
             return
 
         try:
@@ -78,16 +99,17 @@ async def pet_ws(websocket: WebSocket) -> None:
         if envelope.type == "session.init":
             await _handle_session_init(websocket, session, envelope)
         elif envelope.type == "heartbeat":
-            await websocket.send_json(
-                build_event(
-                    "heartbeat.ack",
-                    {"ok": True},
-                    session_id=session.session_id,
-                    request_id=envelope.request_id,
+            if await _ensure_ready_session(websocket, session, envelope):
+                await websocket.send_json(
+                    build_event(
+                        "heartbeat.ack",
+                        {"ok": True},
+                        session_id=session.session_id,
+                        request_id=envelope.request_id,
+                    )
                 )
-            )
         elif envelope.type == "text.input":
-            await _handle_text_input(websocket, session, envelope)
+            await _handle_text_input(websocket, session, envelope, upstream)
         elif envelope.type == "audio.chunk":
             if await _ensure_ready_session(websocket, session, envelope):
                 await _handle_audio_chunk(websocket, session, envelope)
@@ -116,20 +138,23 @@ async def pet_ws(websocket: WebSocket) -> None:
                     "behavior_event_received",
                 )
         elif envelope.type == "client.command":
-            await websocket.send_json(
-                build_error(
-                    ErrorCode.INVALID_CLIENT_COMMAND,
-                    "Client command is not supported",
-                    retryable=False,
-                    request_id=envelope.request_id,
-                    session_id=session.session_id or envelope.session_id,
-                    field="command",
+            if await _ensure_ready_session(websocket, session, envelope):
+                await websocket.send_json(
+                    build_error(
+                        ErrorCode.INVALID_CLIENT_COMMAND,
+                        "Client command is not supported",
+                        retryable=False,
+                        request_id=envelope.request_id,
+                        session_id=session.session_id,
+                        field="command",
+                    )
                 )
-            )
         elif envelope.type == "conversation.interrupt":
-            await _handle_interrupt(websocket, session, envelope)
+            if await _ensure_ready_session(websocket, session, envelope):
+                await _handle_interrupt(websocket, session, envelope, upstream)
         elif envelope.type == "client.tts.started":
             if await _ensure_ready_session(websocket, session, envelope):
+                session.transition_to(SessionState.WAITING_CLIENT_PLAYBACK)
                 await _send_status(
                     websocket,
                     session,
@@ -139,6 +164,7 @@ async def pet_ws(websocket: WebSocket) -> None:
         elif envelope.type == "client.tts.finished":
             if await _ensure_ready_session(websocket, session, envelope):
                 session.active_turn_id = None
+                session.transition_to(SessionState.IDLE)
                 await _send_status(
                     websocket,
                     session,
@@ -146,16 +172,18 @@ async def pet_ws(websocket: WebSocket) -> None:
                     "client_tts_finished",
                 )
         elif envelope.type == "session.close":
-            await websocket.send_json(
-                build_event(
-                    "session.closed",
-                    {"reason": envelope.payload.get("reason", "client_shutdown")},
-                    session_id=session.session_id,
-                    request_id=envelope.request_id,
+            if await _ensure_close_allowed(websocket, session, envelope):
+                session.transition_to(SessionState.CLOSING)
+                await websocket.send_json(
+                    build_event(
+                        "session.closed",
+                        {"reason": envelope.payload.get("reason", "client_shutdown")},
+                        session_id=session.session_id,
+                        request_id=envelope.request_id,
+                    )
                 )
-            )
-            await websocket.close()
-            return
+                await websocket.close()
+                return
         else:
             await websocket.send_json(
                 build_error(
@@ -174,6 +202,19 @@ async def _handle_session_init(
     session: PetSession,
     envelope,
 ) -> None:
+    if session.state != SessionState.CONNECTED:
+        await websocket.send_json(
+            build_error(
+                ErrorCode.INVALID_MESSAGE,
+                "Session is already initialized",
+                retryable=False,
+                request_id=envelope.request_id,
+                session_id=session.session_id,
+                field="type",
+            )
+        )
+        return
+
     config_id = envelope.payload.get("config_id") or DEFAULT_CONFIG_ID
     if get_config(config_id) is None:
         await websocket.send_json(
@@ -190,7 +231,7 @@ async def _handle_session_init(
     session.session_id = f"ses_{uuid4().hex}"
     session.device_id = envelope.payload.get("device_id")
     session.config_id = config_id
-    session.ready = True
+    session.transition_to(SessionState.READY)
 
     await websocket.send_json(
         build_event(
@@ -212,16 +253,13 @@ async def _handle_session_init(
     )
 
 
-async def _handle_text_input(websocket: WebSocket, session: PetSession, envelope) -> None:
-    if not session.ready or session.session_id is None:
-        await websocket.send_json(
-            build_error(
-                ErrorCode.SESSION_NOT_READY,
-                "Session is not ready",
-                retryable=False,
-                request_id=envelope.request_id,
-            )
-        )
+async def _handle_text_input(
+    websocket: WebSocket,
+    session: PetSession,
+    envelope,
+    upstream: UpstreamAdapter,
+) -> None:
+    if not await _ensure_ready_session(websocket, session, envelope):
         return
     if session.active_turn_id is not None:
         await websocket.send_json(
@@ -239,38 +277,47 @@ async def _handle_text_input(websocket: WebSocket, session: PetSession, envelope
     turn_id = f"turn_{uuid4().hex}"
     response_id = f"rsp_{uuid4().hex}"
     session.active_turn_id = turn_id
-    for event in (
+    session.transition_to(SessionState.PROCESSING)
+    await websocket.send_json(
         build_event(
             "conversation.started",
             {"turn_id": turn_id, "trigger": "text"},
             session_id=session.session_id,
             request_id=envelope.request_id,
-        ),
-        build_event(
-            "status.update",
-            {"stage": "thinking"},
-            session_id=session.session_id,
-            request_id=envelope.request_id,
-        ),
+        )
+    )
+    await _send_status(websocket, session, envelope.request_id, "thinking")
+
+    result = await upstream.start_text_turn(envelope.payload.get("text", ""))
+    session.transition_to(SessionState.RESPONDING)
+    await websocket.send_json(
         build_event(
             "response.text",
             {
                 "response_id": response_id,
                 "turn_id": turn_id,
-                "text": "我收到你的消息了。",
-                "voice": "normal",
+                "text": result.text,
+                "voice": result.voice,
             },
             session_id=session.session_id,
             request_id=envelope.request_id,
-        ),
+        )
+    )
+    session.transition_to(SessionState.WAITING_CLIENT_PLAYBACK)
+    await websocket.send_json(
         build_event(
             "response.complete",
             {"response_id": response_id, "turn_id": turn_id},
             session_id=session.session_id,
             request_id=envelope.request_id,
-        ),
-    ):
-        await websocket.send_json(event)
+        )
+    )
+    await _send_status(
+        websocket,
+        session,
+        envelope.request_id,
+        "waiting_client_playback",
+    )
 
 
 async def _handle_audio_chunk(websocket: WebSocket, session: PetSession, envelope) -> None:
@@ -371,6 +418,7 @@ async def _handle_audio_chunk(websocket: WebSocket, session: PetSession, envelop
         return
 
     session.last_audio_seq = seq
+    session.transition_to(SessionState.LISTENING)
     await _send_status(websocket, session, envelope.request_id, "audio_received")
 
 
@@ -469,7 +517,12 @@ async def _handle_image_upload(websocket: WebSocket, session: PetSession, envelo
     await _send_status(websocket, session, envelope.request_id, "image_received")
 
 
-async def _handle_interrupt(websocket: WebSocket, session: PetSession, envelope) -> None:
+async def _handle_interrupt(
+    websocket: WebSocket,
+    session: PetSession,
+    envelope,
+    upstream: UpstreamAdapter,
+) -> None:
     if session.active_turn_id is None:
         await websocket.send_json(
             build_error(
@@ -484,6 +537,11 @@ async def _handle_interrupt(websocket: WebSocket, session: PetSession, envelope)
 
     turn_id = session.active_turn_id
     session.active_turn_id = None
+    await upstream.interrupt_turn(
+        turn_id,
+        envelope.payload.get("reason", "user_speaking_again"),
+    )
+    session.transition_to(SessionState.IDLE)
     await websocket.send_json(
         build_event(
             "conversation.interrupted_ack",
@@ -502,7 +560,7 @@ async def _ensure_ready_session(
     session: PetSession,
     envelope,
 ) -> bool:
-    if not session.ready or session.session_id is None:
+    if not session.is_initialized():
         await websocket.send_json(
             build_error(
                 ErrorCode.SESSION_NOT_READY,
@@ -528,6 +586,28 @@ async def _ensure_ready_session(
     return True
 
 
+async def _ensure_close_allowed(
+    websocket: WebSocket,
+    session: PetSession,
+    envelope,
+) -> bool:
+    if session.session_id is None:
+        return True
+    if envelope.session_id != session.session_id:
+        await websocket.send_json(
+            build_error(
+                ErrorCode.INVALID_MESSAGE,
+                "Session id does not match active session",
+                retryable=False,
+                request_id=envelope.request_id,
+                session_id=session.session_id,
+                field="session_id",
+            )
+        )
+        return False
+    return True
+
+
 async def _send_status(
     websocket: WebSocket,
     session: PetSession,
@@ -537,7 +617,7 @@ async def _send_status(
     await websocket.send_json(
         build_event(
             "status.update",
-            {"stage": stage},
+            {"stage": stage, "state": session.state.value},
             session_id=session.session_id,
             request_id=request_id,
         )
