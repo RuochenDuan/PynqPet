@@ -1,4 +1,8 @@
 服务端说明.md
 .idea/
-.venv
-tests/
+.venv/
+.uv-cache/
+.pytest_cache/
+.ruff_cache/
+pytest-cache-files-*/
+__pycache__/
