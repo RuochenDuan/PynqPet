@@ -1,1 +1,4 @@
-*.md
+服务端说明.md
+.idea/
+.venv
+tests/
