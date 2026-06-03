@@ -111,6 +111,10 @@ def receive_until_request_id(websocket, request_id: str, *, limit: int = 6) -> d
     raise AssertionError(f"Did not receive request_id {request_id!r} within {limit} events")
 
 
+def receive_text_turn_events(websocket) -> list[dict]:
+    return [websocket.receive_json() for _ in range(5)]
+
+
 @pytest.mark.parametrize(
     ("event_type", "payload"),
     [
@@ -884,14 +888,61 @@ def test_conversation_interrupt_after_text_input_returns_interrupted_ack() -> No
     }
 
 
+def test_audio_chunk_while_waiting_playback_interrupts_active_turn() -> None:
+    with client.websocket_connect("/api/v1/pet/ws") as websocket:
+        ready = init_session(websocket)
+
+        websocket.send_text(
+            envelope(
+                "text.input",
+                {"text": "你好"},
+                request_id="req_text_before_audio_interrupt",
+                session_id=ready["session_id"],
+            )
+        )
+        started = websocket.receive_json()
+        for _ in range(4):
+            websocket.receive_json()
+
+        websocket.send_text(
+            envelope(
+                "audio.chunk",
+                audio_chunk(1),
+                request_id="req_audio_interrupt",
+                session_id=ready["session_id"],
+            )
+        )
+        interrupted = websocket.receive_json()
+
+    assert interrupted["type"] == "conversation.interrupted_ack"
+    assert interrupted["request_id"] == "req_audio_interrupt"
+    assert interrupted["session_id"] == ready["session_id"]
+    assert interrupted["payload"] == {
+        "turn_id": started["payload"]["turn_id"],
+        "reason": "user_speaking_again",
+    }
+
+
 def test_client_tts_lifecycle_returns_status_updates() -> None:
     with client.websocket_connect("/api/v1/pet/ws") as websocket:
         ready = init_session(websocket)
 
         websocket.send_text(
             envelope(
+                "text.input",
+                {"text": "你好"},
+                request_id="req_text_for_tts_lifecycle",
+                session_id=ready["session_id"],
+            )
+        )
+        response = receive_until_type(websocket, "response.text")
+        response_id = response["payload"]["response_id"]
+        receive_until_type(websocket, "status.update")
+
+        websocket.send_text(
+            envelope(
                 "client.tts.started",
-                {"response_id": "rsp_001"},
+                {"response_id": response_id},
                 request_id="req_tts_started",
                 session_id=ready["session_id"],
             )
@@ -901,7 +952,7 @@ def test_client_tts_lifecycle_returns_status_updates() -> None:
         websocket.send_text(
             envelope(
                 "client.tts.finished",
-                {"response_id": "rsp_001"},
+                {"response_id": response_id},
                 request_id="req_tts_finished",
                 session_id=ready["session_id"],
             )
@@ -924,6 +975,77 @@ def test_client_tts_lifecycle_returns_status_updates() -> None:
     )
 
 
+def test_client_tts_started_with_wrong_response_id_returns_invalid_message() -> None:
+    with client.websocket_connect("/api/v1/pet/ws") as websocket:
+        ready = init_session(websocket)
+
+        websocket.send_text(
+            envelope(
+                "text.input",
+                {"text": "你好"},
+                request_id="req_text_for_wrong_tts_started",
+                session_id=ready["session_id"],
+            )
+        )
+        receive_text_turn_events(websocket)
+
+        websocket.send_text(
+            envelope(
+                "client.tts.started",
+                {"response_id": "rsp_wrong"},
+                request_id="req_wrong_tts_started",
+                session_id=ready["session_id"],
+            )
+        )
+        event = websocket.receive_json()
+
+    assert_error_code(event, "INVALID_MESSAGE", "req_wrong_tts_started")
+    assert event["payload"]["field"] == "response_id"
+
+
+def test_client_tts_finished_with_wrong_response_id_does_not_clear_active_turn() -> None:
+    with client.websocket_connect("/api/v1/pet/ws") as websocket:
+        ready = init_session(websocket)
+
+        websocket.send_text(
+            envelope(
+                "text.input",
+                {"text": "你好"},
+                request_id="req_text_for_wrong_tts_finished",
+                session_id=ready["session_id"],
+            )
+        )
+        events = receive_text_turn_events(websocket)
+        started = events[0]
+        response = events[2]
+        assert response["payload"]["response_id"] != "rsp_wrong"
+
+        websocket.send_text(
+            envelope(
+                "client.tts.finished",
+                {"response_id": "rsp_wrong"},
+                request_id="req_wrong_tts_finished",
+                session_id=ready["session_id"],
+            )
+        )
+        error = websocket.receive_json()
+
+        websocket.send_text(
+            envelope(
+                "conversation.interrupt",
+                {"reason": "user_speaking_again"},
+                request_id="req_interrupt_after_wrong_tts",
+                session_id=ready["session_id"],
+            )
+        )
+        interrupted = websocket.receive_json()
+
+    assert_error_code(error, "INVALID_MESSAGE", "req_wrong_tts_finished")
+    assert error["payload"]["field"] == "response_id"
+    assert interrupted["type"] == "conversation.interrupted_ack"
+    assert interrupted["payload"]["turn_id"] == started["payload"]["turn_id"]
+
+
 def test_client_tts_finished_clears_active_turn() -> None:
     with client.websocket_connect("/api/v1/pet/ws") as websocket:
         ready = init_session(websocket)
@@ -936,13 +1058,14 @@ def test_client_tts_finished_clears_active_turn() -> None:
                 session_id=ready["session_id"],
             )
         )
-        for _ in range(4):
-            websocket.receive_json()
+        response = receive_until_type(websocket, "response.text")
+        response_id = response["payload"]["response_id"]
+        receive_until_type(websocket, "status.update")
 
         websocket.send_text(
             envelope(
                 "client.tts.finished",
-                {"response_id": "rsp_001"},
+                {"response_id": response_id},
                 request_id="req_finish_turn",
                 session_id=ready["session_id"],
             )
@@ -981,13 +1104,14 @@ def test_client_tts_finished_allows_new_text_input_from_idle() -> None:
                 session_id=ready["session_id"],
             )
         )
-        for _ in range(4):
-            websocket.receive_json()
+        response = receive_until_type(websocket, "response.text")
+        response_id = response["payload"]["response_id"]
+        receive_until_type(websocket, "status.update")
 
         websocket.send_text(
             envelope(
                 "client.tts.finished",
-                {"response_id": "rsp_001"},
+                {"response_id": response_id},
                 request_id="req_finish_turn",
                 session_id=ready["session_id"],
             )
