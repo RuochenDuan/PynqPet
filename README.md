@@ -4,15 +4,13 @@
 
 - Name the git branch as `feature/xxx` for adding new function.
 
-- DON'T USE REBASE FOR MERGING.
+- DON'T USE REBASE FOR MERGING. PR IS RECOMMENDED.
 
 - Open files in utf-8.
 
 - Don't delete any annotation.
 
 ---
-
-# HUMAN READ
 
 ## 仓库结构
 
