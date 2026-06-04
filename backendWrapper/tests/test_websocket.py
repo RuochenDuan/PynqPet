@@ -11,7 +11,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from pynq_pet_gateway.app import app
 from pynq_pet_gateway.protocol import DEFAULT_CONFIG_ID
-from pynq_pet_gateway.upstream import UpstreamBridgeError
+from pynq_pet_gateway.upstream import (
+    AudioChunkResult,
+    TextSegment,
+    TextTurnResult,
+    UpstreamBridgeError,
+)
 
 
 client = TestClient(app)
@@ -381,6 +386,59 @@ def test_text_input_upstream_failure_returns_protocol_error(monkeypatch) -> None
     assert error["payload"]["field"] == "upstream"
 
 
+def test_text_input_with_upstream_actions_sends_response_behavior(monkeypatch) -> None:
+    from pynq_pet_gateway import websocket as websocket_module
+
+    class BehaviorAdapter:
+        async def start_text_turn(self, text: str):
+            return TextTurnResult(
+                segments=[
+                    TextSegment(
+                        text="我来显示表情。",
+                        actions={
+                            "command": "oled.display",
+                            "args": {
+                                "content_type": "expression",
+                                "expression": "happy",
+                            },
+                        },
+                    )
+                ]
+            )
+
+        async def interrupt_turn(self, turn_id: str, reason: str) -> None:
+            return None
+
+    monkeypatch.setattr(
+        websocket_module,
+        "create_upstream_adapter",
+        lambda: BehaviorAdapter(),
+    )
+
+    with client.websocket_connect("/api/v1/pet/ws") as websocket:
+        ready = init_session(websocket)
+
+        websocket.send_text(
+            envelope(
+                "text.input",
+                {"text": "笑一下"},
+                request_id="req_behavior_response",
+                session_id=ready["session_id"],
+            )
+        )
+        behavior = receive_until_type(websocket, "response.behavior", limit=5)
+
+    assert behavior["request_id"] == "req_behavior_response"
+    assert behavior["session_id"] == ready["session_id"]
+    assert behavior["payload"]["response_id"].startswith("rsp_")
+    assert behavior["payload"]["command_id"].startswith("cmd_")
+    assert behavior["payload"]["command"] == "oled.display"
+    assert behavior["payload"]["args"] == {
+        "content_type": "expression",
+        "expression": "happy",
+    }
+
+
 def test_text_input_before_ready_returns_session_not_ready_error() -> None:
     with client.websocket_connect("/api/v1/pet/ws") as websocket:
         websocket.send_text(envelope("text.input", {"text": "你好"}, request_id="req_text"))
@@ -417,6 +475,61 @@ def test_audio_chunk_after_ready_returns_audio_received_status() -> None:
         request_id="req_audio",
         session_id=ready["session_id"],
     )
+
+
+def test_audio_chunk_with_olv_vad_turn_sends_audio_conversation(monkeypatch) -> None:
+    from pynq_pet_gateway import websocket as websocket_module
+
+    class VoiceTurnAdapter:
+        uses_upstream_vad = True
+
+        async def start_text_turn(self, text: str):
+            return TextTurnResult(segments=[TextSegment(text="unused")])
+
+        async def interrupt_turn(self, turn_id: str, reason: str) -> None:
+            return None
+
+        async def stream_audio_chunk(self, audio_pcm: bytes):
+            assert audio_pcm == b"\x00\x01\x02\x03"
+            return AudioChunkResult(
+                turn=TextTurnResult(segments=[TextSegment(text="我听到了。")])
+            )
+
+    monkeypatch.setattr(
+        websocket_module,
+        "create_upstream_adapter",
+        lambda: VoiceTurnAdapter(),
+    )
+
+    with client.websocket_connect("/api/v1/pet/ws") as websocket:
+        ready = init_session(websocket)
+
+        websocket.send_text(
+            envelope(
+                "audio.chunk",
+                audio_chunk(1),
+                request_id="req_audio_olv_vad",
+                session_id=ready["session_id"],
+            )
+        )
+        events = [websocket.receive_json() for _ in range(6)]
+
+    assert events[0]["type"] == "status.update"
+    assert events[0]["payload"] == {"stage": "audio_received", "state": "listening"}
+    assert [event["type"] for event in events[1:]] == [
+        "conversation.started",
+        "status.update",
+        "response.text",
+        "response.complete",
+        "status.update",
+    ]
+    assert events[1]["payload"]["trigger"] == "voice"
+    assert events[2]["payload"] == {"stage": "thinking", "state": "processing"}
+    assert events[3]["payload"]["text"] == "我听到了。"
+    assert events[5]["payload"] == {
+        "stage": "waiting_client_playback",
+        "state": "waiting_client_playback",
+    }
 
 
 def test_audio_chunk_enters_listening_without_starting_conversation() -> None:
@@ -930,6 +1043,58 @@ def test_conversation_interrupt_after_text_input_returns_interrupted_ack() -> No
     }
 
 
+def test_conversation_interrupt_upstream_failure_returns_protocol_error(
+    monkeypatch,
+) -> None:
+    from pynq_pet_gateway import websocket as websocket_module
+
+    class FailingInterruptAdapter:
+        async def start_text_turn(self, text: str):
+            return TextTurnResult(segments=[TextSegment(text="还在播放。")])
+
+        async def interrupt_turn(self, turn_id: str, reason: str) -> None:
+            raise UpstreamBridgeError("interrupt failed")
+
+    monkeypatch.setattr(
+        websocket_module,
+        "create_upstream_adapter",
+        lambda: FailingInterruptAdapter(),
+    )
+
+    with client.websocket_connect("/api/v1/pet/ws") as websocket:
+        ready = init_session(websocket)
+
+        websocket.send_text(
+            envelope(
+                "text.input",
+                {"text": "你好"},
+                request_id="req_text_before_failed_interrupt",
+                session_id=ready["session_id"],
+            )
+        )
+        started = websocket.receive_json()
+        for _ in range(4):
+            websocket.receive_json()
+
+        websocket.send_text(
+            envelope(
+                "conversation.interrupt",
+                {"reason": "user_speaking_again"},
+                request_id="req_failed_interrupt",
+                session_id=ready["session_id"],
+            )
+        )
+        error = websocket.receive_json()
+
+    assert started["type"] == "conversation.started"
+    assert error["type"] == "error"
+    assert error["request_id"] == "req_failed_interrupt"
+    assert error["payload"]["code"] == "UPSTREAM_AGENT_ERROR"
+    assert error["payload"]["retryable"] is True
+    assert error["payload"]["field"] == "upstream"
+    assert error["payload"]["turn_id"] == started["payload"]["turn_id"]
+
+
 def test_audio_chunk_while_waiting_playback_interrupts_active_turn() -> None:
     with client.websocket_connect("/api/v1/pet/ws") as websocket:
         ready = init_session(websocket)
@@ -959,6 +1124,62 @@ def test_audio_chunk_while_waiting_playback_interrupts_active_turn() -> None:
     assert interrupted["type"] == "conversation.interrupted_ack"
     assert interrupted["request_id"] == "req_audio_interrupt"
     assert interrupted["session_id"] == ready["session_id"]
+    assert interrupted["payload"] == {
+        "turn_id": started["payload"]["turn_id"],
+        "reason": "user_speaking_again",
+    }
+
+
+def test_audio_chunk_with_olv_vad_interrupt_ack_does_not_resend_interrupt(
+    monkeypatch,
+) -> None:
+    from pynq_pet_gateway import websocket as websocket_module
+
+    class VadInterruptAdapter:
+        uses_upstream_vad = True
+
+        async def start_text_turn(self, text: str):
+            return TextTurnResult(segments=[TextSegment(text="正在回答。")])
+
+        async def interrupt_turn(self, turn_id: str, reason: str) -> None:
+            raise AssertionError("OLV VAD interrupt should not resend interrupt-signal")
+
+        async def stream_audio_chunk(self, audio_pcm: bytes):
+            return AudioChunkResult(interrupted=True)
+
+    monkeypatch.setattr(
+        websocket_module,
+        "create_upstream_adapter",
+        lambda: VadInterruptAdapter(),
+    )
+
+    with client.websocket_connect("/api/v1/pet/ws") as websocket:
+        ready = init_session(websocket)
+
+        websocket.send_text(
+            envelope(
+                "text.input",
+                {"text": "你好"},
+                request_id="req_text_before_vad_interrupt",
+                session_id=ready["session_id"],
+            )
+        )
+        started = websocket.receive_json()
+        for _ in range(4):
+            websocket.receive_json()
+
+        websocket.send_text(
+            envelope(
+                "audio.chunk",
+                audio_chunk(1),
+                request_id="req_audio_vad_interrupt",
+                session_id=ready["session_id"],
+            )
+        )
+        interrupted = websocket.receive_json()
+
+    assert interrupted["type"] == "conversation.interrupted_ack"
+    assert interrupted["request_id"] == "req_audio_vad_interrupt"
     assert interrupted["payload"] == {
         "turn_id": started["payload"]["turn_id"],
         "reason": "user_speaking_again",

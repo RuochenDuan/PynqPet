@@ -20,6 +20,7 @@ from pynq_pet_gateway.protocol import (
     parse_envelope,
 )
 from pynq_pet_gateway.upstream import (
+    AudioChunkResult,
     UpstreamAdapter,
     UpstreamBridgeError,
     create_upstream_adapter,
@@ -87,6 +88,7 @@ async def pet_ws(websocket: WebSocket) -> None:
             raw = await websocket.receive_text()
         except WebSocketDisconnect:
             session.transition_to(SessionState.CLOSING)
+            await _close_upstream(upstream)
             return
 
         try:
@@ -94,6 +96,7 @@ async def pet_ws(websocket: WebSocket) -> None:
         except ProtocolError as exc:
             if exc.__cause__ is not None and isinstance(exc.__cause__, JSONDecodeError):
                 await websocket.close()
+                await _close_upstream(upstream)
                 return
             await websocket.send_json(
                 build_error(
@@ -198,6 +201,7 @@ async def pet_ws(websocket: WebSocket) -> None:
                     )
                 )
                 await websocket.close()
+                await _close_upstream(upstream)
                 return
         else:
             await websocket.send_json(
@@ -337,6 +341,18 @@ async def _handle_text_input(
                 request_id=envelope.request_id,
             )
         )
+        for behavior_payload in _behavior_payloads_from_actions(
+            segment.actions,
+            response_id,
+        ):
+            await websocket.send_json(
+                build_event(
+                    "response.behavior",
+                    behavior_payload,
+                    session_id=session.session_id,
+                    request_id=envelope.request_id,
+                )
+            )
     session.transition_to(SessionState.WAITING_CLIENT_PLAYBACK)
     await websocket.send_json(
         build_event(
@@ -456,19 +472,136 @@ async def _handle_audio_chunk(
         )
         return
 
-    if session.should_interrupt_on_audio():
-        await _send_interrupted_ack(
+    uses_upstream_vad = bool(getattr(upstream, "uses_upstream_vad", False))
+    if not uses_upstream_vad and session.should_interrupt_on_audio():
+        interrupted = await _send_interrupted_ack(
             websocket,
             session,
             envelope,
             upstream,
             reason="user_speaking_again",
         )
+        if not interrupted:
+            return
 
     session.last_audio_seq = seq
     session.audio_buffer.extend(audio_bytes)
     session.transition_to(SessionState.LISTENING)
+
+    try:
+        audio_result = await _stream_audio_chunk(upstream, audio_bytes)
+    except UpstreamBridgeError as exc:
+        await websocket.send_json(
+            build_error(
+                ErrorCode.UPSTREAM_AGENT_ERROR,
+                str(exc),
+                retryable=True,
+                request_id=envelope.request_id,
+                session_id=session.session_id or envelope.session_id,
+                field="upstream",
+            )
+        )
+        return
+
+    if audio_result.interrupted and session.active_turn_id is not None:
+        await _send_interrupted_ack(
+            websocket,
+            session,
+            envelope,
+            upstream,
+            reason="user_speaking_again",
+            notify_upstream=False,
+        )
+        return
+
     await _send_status(websocket, session, envelope.request_id, "audio_received")
+    if audio_result.turn is not None:
+        if session.active_turn_id is not None:
+            await websocket.send_json(
+                build_error(
+                    ErrorCode.TURN_ALREADY_ACTIVE,
+                    "A turn is already active",
+                    retryable=False,
+                    request_id=envelope.request_id,
+                    session_id=session.session_id,
+                    turn_id=session.active_turn_id,
+                )
+            )
+            return
+        await _send_turn_result(
+            websocket,
+            session,
+            envelope.request_id,
+            audio_result.turn,
+            trigger="voice",
+        )
+
+
+async def _send_turn_result(
+    websocket: WebSocket,
+    session: PetSession,
+    request_id: str | None,
+    result,
+    *,
+    trigger: str,
+) -> None:
+    turn_id = f"turn_{uuid4().hex}"
+    response_id = f"rsp_{uuid4().hex}"
+    session.active_turn_id = turn_id
+    session.active_response_id = response_id
+    session.transition_to(SessionState.PROCESSING)
+    await websocket.send_json(
+        build_event(
+            "conversation.started",
+            {"turn_id": turn_id, "trigger": trigger},
+            session_id=session.session_id,
+            request_id=request_id,
+        )
+    )
+    await _send_status(websocket, session, request_id, "thinking")
+
+    session.transition_to(SessionState.RESPONDING)
+    for segment in result.segments:
+        await websocket.send_json(
+            build_event(
+                "response.text",
+                {
+                    "response_id": response_id,
+                    "turn_id": turn_id,
+                    "text": segment.text,
+                    "voice": segment.voice,
+                },
+                session_id=session.session_id,
+                request_id=request_id,
+            )
+        )
+        for behavior_payload in _behavior_payloads_from_actions(
+            segment.actions,
+            response_id,
+        ):
+            await websocket.send_json(
+                build_event(
+                    "response.behavior",
+                    behavior_payload,
+                    session_id=session.session_id,
+                    request_id=request_id,
+                )
+            )
+    session.transition_to(SessionState.WAITING_CLIENT_PLAYBACK)
+    await websocket.send_json(
+        build_event(
+            "response.complete",
+            {"response_id": response_id, "turn_id": turn_id},
+            session_id=session.session_id,
+            request_id=request_id,
+        )
+    )
+    await _send_status(
+        websocket,
+        session,
+        request_id,
+        "waiting_client_playback",
+    )
 
 
 async def _handle_image_upload(websocket: WebSocket, session: PetSession, envelope) -> None:
@@ -600,14 +733,31 @@ async def _send_interrupted_ack(
     upstream: UpstreamAdapter,
     *,
     reason: str,
-) -> None:
+    notify_upstream: bool = True,
+) -> bool:
     turn_id = session.active_turn_id
     if turn_id is None:
-        return
+        return False
+
+    try:
+        if notify_upstream:
+            await upstream.interrupt_turn(turn_id, reason)
+    except UpstreamBridgeError as exc:
+        await websocket.send_json(
+            build_error(
+                ErrorCode.UPSTREAM_AGENT_ERROR,
+                str(exc),
+                retryable=True,
+                request_id=envelope.request_id,
+                session_id=session.session_id or envelope.session_id,
+                turn_id=turn_id,
+                field="upstream",
+            )
+        )
+        return False
 
     session.active_turn_id = None
     session.active_response_id = None
-    await upstream.interrupt_turn(turn_id, reason)
     session.transition_to(SessionState.IDLE)
     await websocket.send_json(
         build_event(
@@ -620,6 +770,17 @@ async def _send_interrupted_ack(
             request_id=envelope.request_id,
         )
     )
+    return True
+
+
+async def _stream_audio_chunk(
+    upstream: UpstreamAdapter,
+    audio_bytes: bytes,
+) -> AudioChunkResult:
+    stream_audio_chunk = getattr(upstream, "stream_audio_chunk", None)
+    if stream_audio_chunk is None:
+        return AudioChunkResult()
+    return await stream_audio_chunk(audio_bytes)
 
 
 async def _ensure_ready_session(
@@ -714,3 +875,86 @@ async def _send_status(
             request_id=request_id,
         )
     )
+
+
+async def _close_upstream(upstream: UpstreamAdapter) -> None:
+    close = getattr(upstream, "close", None)
+    if close is not None:
+        await close()
+
+
+def _behavior_payloads_from_actions(
+    actions: dict[str, Any] | None,
+    response_id: str,
+) -> list[dict[str, Any]]:
+    if not isinstance(actions, dict):
+        return []
+
+    payloads: list[dict[str, Any]] = []
+    commands = actions.get("commands")
+    if isinstance(commands, list):
+        for command in commands:
+            payload = _behavior_payload_from_command(command, response_id)
+            if payload is not None:
+                payloads.append(payload)
+
+    payload = _behavior_payload_from_command(actions, response_id)
+    if payload is not None:
+        payloads.append(payload)
+
+    expressions = actions.get("expressions")
+    if isinstance(expressions, list):
+        for expression in expressions:
+            if isinstance(expression, str) and expression:
+                payloads.append(
+                    _make_behavior_payload(
+                        response_id,
+                        "oled.display",
+                        {
+                            "content_type": "expression",
+                            "expression": expression,
+                        },
+                    )
+                )
+    expression = actions.get("expression")
+    if isinstance(expression, str) and expression:
+        payloads.append(
+            _make_behavior_payload(
+                response_id,
+                "oled.display",
+                {
+                    "content_type": "expression",
+                    "expression": expression,
+                },
+            )
+        )
+
+    return payloads
+
+
+def _behavior_payload_from_command(
+    command: Any,
+    response_id: str,
+) -> dict[str, Any] | None:
+    if not isinstance(command, dict):
+        return None
+    command_name = command.get("command")
+    if not isinstance(command_name, str) or not command_name:
+        return None
+    args = command.get("args", {})
+    if not isinstance(args, dict):
+        args = {}
+    return _make_behavior_payload(response_id, command_name, args)
+
+
+def _make_behavior_payload(
+    response_id: str,
+    command: str,
+    args: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "response_id": response_id,
+        "command_id": f"cmd_{uuid4().hex}",
+        "command": command,
+        "args": args,
+    }

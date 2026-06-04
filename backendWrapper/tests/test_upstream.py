@@ -1,8 +1,10 @@
 import json
+import asyncio
 
 import pytest
 
 from pynq_pet_gateway.upstream import (
+    AudioChunkResult,
     OpenLlmWebSocketAdapter,
     PlaceholderUpstreamAdapter,
     UpstreamBridgeError,
@@ -42,6 +44,15 @@ def make_connect(fake: FakeOpenLlmWebSocket):
     return connect
 
 
+async def wait_until(predicate, *, timeout_s: float = 0.1) -> None:
+    deadline = asyncio.get_running_loop().time() + timeout_s
+    while asyncio.get_running_loop().time() < deadline:
+        if predicate():
+            return
+        await asyncio.sleep(0)
+    raise AssertionError("Timed out waiting for condition")
+
+
 @pytest.mark.asyncio
 async def test_open_llm_ws_adapter_sends_text_input_and_normalizes_full_text() -> None:
     fake = FakeOpenLlmWebSocket(
@@ -66,6 +77,10 @@ async def test_open_llm_ws_adapter_sends_text_input_and_normalizes_full_text() -
     assert fake.sent[0] == {"type": "text-input", "text": "你好", "images": []}
     assert fake.sent[1] == {"type": "frontend-playback-complete"}
     assert [segment.text for segment in result.segments] == ["你好，我在。"]
+    assert fake.closed is False
+
+    await adapter.close()
+
     assert fake.closed is True
 
 
@@ -110,7 +125,45 @@ async def test_open_llm_ws_adapter_sends_interrupt_signal() -> None:
     await adapter.interrupt_turn("turn_001", "user_speaking_again")
 
     assert fake.sent == [{"type": "interrupt-signal", "text": ""}]
+    assert fake.closed is False
+
+    await adapter.close()
+
     assert fake.closed is True
+
+
+@pytest.mark.asyncio
+async def test_open_llm_ws_adapter_interrupt_uses_active_connection() -> None:
+    active_fake = FakeOpenLlmWebSocket([])
+    extra_fake = FakeOpenLlmWebSocket([])
+    connected: list[FakeOpenLlmWebSocket] = []
+
+    async def connect(url: str):
+        fake = active_fake if not connected else extra_fake
+        connected.append(fake)
+        return fake
+
+    adapter = OpenLlmWebSocketAdapter(
+        "ws://example.test/client-ws",
+        connect=connect,
+        receive_timeout_s=0.05,
+        initial_drain_timeout_s=0.01,
+    )
+    turn_task = asyncio.create_task(adapter.start_text_turn("你好"))
+    await wait_until(
+        lambda: active_fake.sent == [{"type": "text-input", "text": "你好", "images": []}]
+    )
+
+    await adapter.interrupt_turn("turn_001", "user_speaking_again")
+
+    assert connected == [active_fake]
+    assert active_fake.sent == [
+        {"type": "text-input", "text": "你好", "images": []},
+        {"type": "interrupt-signal", "text": ""},
+    ]
+    assert extra_fake.sent == []
+    with pytest.raises(UpstreamBridgeError):
+        await turn_task
 
 
 @pytest.mark.asyncio
@@ -136,6 +189,69 @@ async def test_open_llm_ws_adapter_sends_audio_data_and_audio_end() -> None:
     assert fake.sent[1] == {"type": "mic-audio-end"}
     assert fake.sent[2] == {"type": "frontend-playback-complete"}
     assert [segment.text for segment in result.segments] == ["我听到了。"]
+
+
+@pytest.mark.asyncio
+async def test_open_llm_ws_adapter_streams_raw_audio_chunk_without_client_cutoff() -> None:
+    pcm_silence = b"\x00\x00\x00\x40"
+    fake = FakeOpenLlmWebSocket([])
+    adapter = OpenLlmWebSocketAdapter(
+        "ws://example.test/client-ws",
+        connect=make_connect(fake),
+        receive_timeout_s=0.01,
+        initial_drain_timeout_s=0.01,
+        audio_control_timeout_s=0.01,
+    )
+
+    result = await adapter.stream_audio_chunk(pcm_silence)
+
+    assert fake.sent == [{"type": "raw-audio-data", "audio": [0.0, 0.5]}]
+    assert result == AudioChunkResult()
+
+
+@pytest.mark.asyncio
+async def test_open_llm_ws_adapter_uses_olv_vad_control_to_trigger_audio_turn() -> None:
+    pcm_silence = b"\x00\x00\x00\x40"
+    fake = FakeOpenLlmWebSocket(
+        [
+            {"type": "control", "text": "mic-audio-end"},
+            {"type": "full-text", "text": "我听到了。"},
+            {"type": "backend-synth-complete"},
+        ]
+    )
+    adapter = OpenLlmWebSocketAdapter(
+        "ws://example.test/client-ws",
+        connect=make_connect(fake),
+        receive_timeout_s=0.01,
+        initial_drain_timeout_s=0.01,
+        audio_control_timeout_s=0.01,
+    )
+
+    result = await adapter.stream_audio_chunk(pcm_silence)
+
+    assert fake.sent[0] == {"type": "raw-audio-data", "audio": [0.0, 0.5]}
+    assert fake.sent[1] == {"type": "mic-audio-end"}
+    assert fake.sent[2] == {"type": "frontend-playback-complete"}
+    assert result.turn is not None
+    assert [segment.text for segment in result.turn.segments] == ["我听到了。"]
+
+
+@pytest.mark.asyncio
+async def test_open_llm_ws_adapter_maps_olv_vad_interrupt_control() -> None:
+    fake = FakeOpenLlmWebSocket([{"type": "control", "text": "interrupt"}])
+    adapter = OpenLlmWebSocketAdapter(
+        "ws://example.test/client-ws",
+        connect=make_connect(fake),
+        receive_timeout_s=0.01,
+        initial_drain_timeout_s=0.01,
+        audio_control_timeout_s=0.01,
+    )
+
+    result = await adapter.stream_audio_chunk(b"\x00\x00")
+
+    assert fake.sent == [{"type": "raw-audio-data", "audio": [0.0]}]
+    assert result.interrupted is True
+    assert result.turn is None
 
 
 @pytest.mark.asyncio
