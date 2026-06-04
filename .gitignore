@@ -13,6 +13,7 @@
 *.o
 *.d
 /build/
+.tmp/
 
 # logs
 logs/
@@ -22,6 +23,7 @@ logs/
 # caches
 __pycache__/
 *.py[cod]
+.uv-cache/
 
 # agent configs
 claude.md
@@ -30,3 +32,7 @@ AGENT.md
 .copilot/
 .gemini/
 .cursor/
+.trae/
+
+# system
+.DS_Store/
