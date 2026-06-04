@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import base64
 import binascii
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from json import JSONDecodeError
 from typing import Any
@@ -19,7 +19,11 @@ from pynq_pet_gateway.protocol import (
     build_event,
     parse_envelope,
 )
-from pynq_pet_gateway.upstream import PlaceholderUpstreamAdapter, UpstreamAdapter
+from pynq_pet_gateway.upstream import (
+    UpstreamAdapter,
+    UpstreamBridgeError,
+    create_upstream_adapter,
+)
 
 
 router = APIRouter()
@@ -57,6 +61,7 @@ class PetSession:
     behavior_event_count: int = 0
     active_turn_id: str | None = None
     active_response_id: str | None = None
+    audio_buffer: bytearray = field(default_factory=bytearray)
 
     def is_initialized(self) -> bool:
         return self.session_id is not None and self.state != SessionState.CONNECTED
@@ -75,7 +80,7 @@ class PetSession:
 async def pet_ws(websocket: WebSocket) -> None:
     await websocket.accept()
     session = PetSession()
-    upstream = PlaceholderUpstreamAdapter()
+    upstream = create_upstream_adapter()
 
     while True:
         try:
@@ -299,21 +304,39 @@ async def _handle_text_input(
     )
     await _send_status(websocket, session, envelope.request_id, "thinking")
 
-    result = await upstream.start_text_turn(envelope.payload.get("text", ""))
-    session.transition_to(SessionState.RESPONDING)
-    await websocket.send_json(
-        build_event(
-            "response.text",
-            {
-                "response_id": response_id,
-                "turn_id": turn_id,
-                "text": result.text,
-                "voice": result.voice,
-            },
-            session_id=session.session_id,
-            request_id=envelope.request_id,
+    try:
+        result = await upstream.start_text_turn(envelope.payload.get("text", ""))
+    except UpstreamBridgeError as exc:
+        session.active_turn_id = None
+        session.active_response_id = None
+        session.transition_to(SessionState.IDLE)
+        await websocket.send_json(
+            build_error(
+                ErrorCode.UPSTREAM_AGENT_ERROR,
+                str(exc),
+                retryable=True,
+                request_id=envelope.request_id,
+                session_id=session.session_id,
+                field="upstream",
+            )
         )
-    )
+        return
+
+    session.transition_to(SessionState.RESPONDING)
+    for segment in result.segments:
+        await websocket.send_json(
+            build_event(
+                "response.text",
+                {
+                    "response_id": response_id,
+                    "turn_id": turn_id,
+                    "text": segment.text,
+                    "voice": segment.voice,
+                },
+                session_id=session.session_id,
+                request_id=envelope.request_id,
+            )
+        )
     session.transition_to(SessionState.WAITING_CLIENT_PLAYBACK)
     await websocket.send_json(
         build_event(
@@ -443,6 +466,7 @@ async def _handle_audio_chunk(
         )
 
     session.last_audio_seq = seq
+    session.audio_buffer.extend(audio_bytes)
     session.transition_to(SessionState.LISTENING)
     await _send_status(websocket, session, envelope.request_id, "audio_received")
 

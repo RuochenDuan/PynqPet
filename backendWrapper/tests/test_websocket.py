@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from pynq_pet_gateway.app import app
 from pynq_pet_gateway.protocol import DEFAULT_CONFIG_ID
+from pynq_pet_gateway.upstream import UpstreamBridgeError
 
 
 client = TestClient(app)
@@ -337,6 +338,47 @@ def test_text_input_after_ready_sends_response_sequence() -> None:
         "stage": "waiting_client_playback",
         "state": "waiting_client_playback",
     }
+
+
+def test_text_input_upstream_failure_returns_protocol_error(monkeypatch) -> None:
+    from pynq_pet_gateway import websocket as websocket_module
+
+    class FailingAdapter:
+        async def start_text_turn(self, text: str):
+            raise UpstreamBridgeError("Open-LLM unavailable")
+
+        async def interrupt_turn(self, turn_id: str, reason: str) -> None:
+            return None
+
+    monkeypatch.setattr(
+        websocket_module,
+        "create_upstream_adapter",
+        lambda: FailingAdapter(),
+    )
+
+    with client.websocket_connect("/api/v1/pet/ws") as websocket:
+        ready = init_session(websocket)
+
+        websocket.send_text(
+            envelope(
+                "text.input",
+                {"text": "你好"},
+                request_id="req_text_upstream_error",
+                session_id=ready["session_id"],
+            )
+        )
+        started = websocket.receive_json()
+        status = websocket.receive_json()
+        error = websocket.receive_json()
+
+    assert started["type"] == "conversation.started"
+    assert status["payload"] == {"stage": "thinking", "state": "processing"}
+    assert error["type"] == "error"
+    assert error["request_id"] == "req_text_upstream_error"
+    assert error["payload"]["code"] == "UPSTREAM_AGENT_ERROR"
+    assert error["payload"]["request_id"] == "req_text_upstream_error"
+    assert error["payload"]["retryable"] is True
+    assert error["payload"]["field"] == "upstream"
 
 
 def test_text_input_before_ready_returns_session_not_ready_error() -> None:
