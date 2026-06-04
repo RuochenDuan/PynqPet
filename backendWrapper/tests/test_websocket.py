@@ -121,6 +121,16 @@ def receive_text_turn_events(websocket) -> list[dict]:
     return [websocket.receive_json() for _ in range(5)]
 
 
+def receive_until_complete(websocket, *, limit: int = 8) -> list[dict]:
+    events: list[dict] = []
+    for _ in range(limit):
+        event = websocket.receive_json()
+        events.append(event)
+        if event["type"] == "response.complete":
+            return events
+    raise AssertionError(f"Did not receive 'response.complete' within {limit} events")
+
+
 @pytest.mark.parametrize(
     ("event_type", "payload"),
     [
@@ -437,6 +447,341 @@ def test_text_input_with_upstream_actions_sends_response_behavior(monkeypatch) -
         "content_type": "expression",
         "expression": "happy",
     }
+
+
+def test_text_input_with_legacy_upstream_expression_maps_to_pynq_behavior(
+    monkeypatch,
+) -> None:
+    from pynq_pet_gateway import websocket as websocket_module
+
+    class BehaviorAdapter:
+        async def start_text_turn(self, text: str):
+            return TextTurnResult(
+                segments=[
+                    TextSegment(
+                        text="旧表情映射。",
+                        actions={"expressions": ["joy"]},
+                    )
+                ]
+            )
+
+        async def interrupt_turn(self, turn_id: str, reason: str) -> None:
+            return None
+
+    monkeypatch.setattr(
+        websocket_module,
+        "create_upstream_adapter",
+        lambda: BehaviorAdapter(),
+    )
+
+    with client.websocket_connect("/api/v1/pet/ws") as websocket:
+        ready = init_session(websocket)
+
+        websocket.send_text(
+            envelope(
+                "text.input",
+                {"text": "笑一下"},
+                request_id="req_legacy_expression",
+                session_id=ready["session_id"],
+            )
+        )
+        events = receive_until_complete(websocket)
+
+    behaviors = [event for event in events if event["type"] == "response.behavior"]
+    assert len(behaviors) == 1
+    assert behaviors[0]["payload"]["args"] == {
+        "content_type": "expression",
+        "expression": "happy",
+    }
+
+
+def test_text_input_with_unknown_upstream_expression_does_not_send_behavior(
+    monkeypatch,
+) -> None:
+    from pynq_pet_gateway import websocket as websocket_module
+
+    class BehaviorAdapter:
+        async def start_text_turn(self, text: str):
+            return TextTurnResult(
+                segments=[
+                    TextSegment(
+                        text="未知表情不透传。",
+                        actions={"expressions": ["excited"]},
+                    )
+                ]
+            )
+
+        async def interrupt_turn(self, turn_id: str, reason: str) -> None:
+            return None
+
+    monkeypatch.setattr(
+        websocket_module,
+        "create_upstream_adapter",
+        lambda: BehaviorAdapter(),
+    )
+
+    with client.websocket_connect("/api/v1/pet/ws") as websocket:
+        ready = init_session(websocket)
+
+        websocket.send_text(
+            envelope(
+                "text.input",
+                {"text": "未知表情"},
+                request_id="req_unknown_expression",
+                session_id=ready["session_id"],
+            )
+        )
+        events = receive_until_complete(websocket)
+
+    assert [event for event in events if event["type"] == "response.behavior"] == []
+
+
+def test_text_input_with_legacy_text_expression_tag_cleans_and_maps_behavior(
+    monkeypatch,
+) -> None:
+    from pynq_pet_gateway import websocket as websocket_module
+
+    class TaggedTextAdapter:
+        async def start_text_turn(self, text: str):
+            return TextTurnResult(segments=[TextSegment(text="[smirk] 你好")])
+
+        async def interrupt_turn(self, turn_id: str, reason: str) -> None:
+            return None
+
+    monkeypatch.setattr(
+        websocket_module,
+        "create_upstream_adapter",
+        lambda: TaggedTextAdapter(),
+    )
+
+    with client.websocket_connect("/api/v1/pet/ws") as websocket:
+        ready = init_session(websocket)
+
+        websocket.send_text(
+            envelope(
+                "text.input",
+                {"text": "你好"},
+                request_id="req_legacy_text_expression",
+                session_id=ready["session_id"],
+            )
+        )
+        events = receive_until_complete(websocket)
+
+    text_event = next(event for event in events if event["type"] == "response.text")
+    behaviors = [event for event in events if event["type"] == "response.behavior"]
+    assert text_event["payload"]["text"] == "你好"
+    assert len(behaviors) == 1
+    assert behaviors[0]["payload"]["args"] == {
+        "content_type": "expression",
+        "expression": "happy",
+    }
+
+
+def test_text_input_with_legacy_command_expression_maps_behavior(monkeypatch) -> None:
+    from pynq_pet_gateway import websocket as websocket_module
+
+    class BehaviorAdapter:
+        async def start_text_turn(self, text: str):
+            return TextTurnResult(
+                segments=[
+                    TextSegment(
+                        text="命令表情映射。",
+                        actions={
+                            "command": "oled.display",
+                            "args": {
+                                "content_type": "expression",
+                                "expression": "sadness",
+                            },
+                        },
+                    )
+                ]
+            )
+
+        async def interrupt_turn(self, turn_id: str, reason: str) -> None:
+            return None
+
+    monkeypatch.setattr(
+        websocket_module,
+        "create_upstream_adapter",
+        lambda: BehaviorAdapter(),
+    )
+
+    with client.websocket_connect("/api/v1/pet/ws") as websocket:
+        ready = init_session(websocket)
+
+        websocket.send_text(
+            envelope(
+                "text.input",
+                {"text": "难过一下"},
+                request_id="req_legacy_command_expression",
+                session_id=ready["session_id"],
+            )
+        )
+        events = receive_until_complete(websocket)
+
+    behavior = next(event for event in events if event["type"] == "response.behavior")
+    assert behavior["payload"]["args"] == {
+        "content_type": "expression",
+        "expression": "sad",
+    }
+
+
+def test_text_input_with_pynq_command_block_sends_behavior_and_cleans_text(
+    monkeypatch,
+) -> None:
+    from pynq_pet_gateway import websocket as websocket_module
+
+    class CommandBlockAdapter:
+        async def start_text_turn(self, text: str):
+            return TextTurnResult(
+                segments=[
+                    TextSegment(
+                        text=(
+                            "我来拍一张照片。\n"
+                            "<PYNQ_COMMANDS>\n"
+                            '[{"command":"camera.capture","args":{}}]\n'
+                            "</PYNQ_COMMANDS>"
+                        )
+                    )
+                ]
+            )
+
+        async def interrupt_turn(self, turn_id: str, reason: str) -> None:
+            return None
+
+    monkeypatch.setattr(
+        websocket_module,
+        "create_upstream_adapter",
+        lambda: CommandBlockAdapter(),
+    )
+
+    with client.websocket_connect("/api/v1/pet/ws") as websocket:
+        ready = init_session(websocket)
+
+        websocket.send_text(
+            envelope(
+                "text.input",
+                {"text": "拍照"},
+                request_id="req_command_block",
+                session_id=ready["session_id"],
+            )
+        )
+        events = receive_until_complete(websocket, limit=8)
+
+    text_event = next(event for event in events if event["type"] == "response.text")
+    behavior = next(event for event in events if event["type"] == "response.behavior")
+    assert text_event["payload"]["text"] == "我来拍一张照片。"
+    assert behavior["payload"]["command"] == "camera.capture"
+    assert behavior["payload"]["args"] == {}
+
+
+def test_text_input_with_multiple_pynq_commands_preserves_behavior_order(
+    monkeypatch,
+) -> None:
+    from pynq_pet_gateway import websocket as websocket_module
+
+    class CommandBlockAdapter:
+        async def start_text_turn(self, text: str):
+            return TextTurnResult(
+                segments=[
+                    TextSegment(
+                        text=(
+                            "<PYNQ_COMMANDS>"
+                            "["
+                            '{"command":"ui.switch_screen","args":{"screen_id":"camera_capture_screen"}},'
+                            '{"command":"pet.update_status","args":{"mood_delta":2,"status_text":"很好奇"}}'
+                            "]"
+                            "</PYNQ_COMMANDS>"
+                            "准备好了。"
+                        )
+                    )
+                ]
+            )
+
+        async def interrupt_turn(self, turn_id: str, reason: str) -> None:
+            return None
+
+    monkeypatch.setattr(
+        websocket_module,
+        "create_upstream_adapter",
+        lambda: CommandBlockAdapter(),
+    )
+
+    with client.websocket_connect("/api/v1/pet/ws") as websocket:
+        ready = init_session(websocket)
+
+        websocket.send_text(
+            envelope(
+                "text.input",
+                {"text": "切换界面"},
+                request_id="req_multiple_command_block",
+                session_id=ready["session_id"],
+            )
+        )
+        events = receive_until_complete(websocket, limit=9)
+
+    text_event = next(event for event in events if event["type"] == "response.text")
+    behaviors = [event for event in events if event["type"] == "response.behavior"]
+    assert text_event["payload"]["text"] == "准备好了。"
+    assert [event["payload"]["command"] for event in behaviors] == [
+        "ui.switch_screen",
+        "pet.update_status",
+    ]
+    assert behaviors[0]["payload"]["args"] == {"screen_id": "camera_capture_screen"}
+    assert behaviors[1]["payload"]["args"] == {
+        "mood_delta": 2,
+        "status_text": "很好奇",
+    }
+
+
+@pytest.mark.parametrize(
+    "command_text",
+    [
+        "<PYNQ_COMMANDS>not json</PYNQ_COMMANDS>回复继续。",
+        '<PYNQ_COMMANDS>[{"command":"system.shutdown","args":{}}]</PYNQ_COMMANDS>回复继续。',
+        (
+            "<PYNQ_COMMANDS>"
+            '[{"command":"ui.switch_screen","args":{"screen_id":"unknown_screen"}}]'
+            "</PYNQ_COMMANDS>"
+            "回复继续。"
+        ),
+    ],
+)
+def test_text_input_with_invalid_pynq_command_block_cleans_without_behavior(
+    monkeypatch,
+    command_text: str,
+) -> None:
+    from pynq_pet_gateway import websocket as websocket_module
+
+    class CommandBlockAdapter:
+        async def start_text_turn(self, text: str):
+            return TextTurnResult(segments=[TextSegment(text=command_text)])
+
+        async def interrupt_turn(self, turn_id: str, reason: str) -> None:
+            return None
+
+    monkeypatch.setattr(
+        websocket_module,
+        "create_upstream_adapter",
+        lambda: CommandBlockAdapter(),
+    )
+
+    with client.websocket_connect("/api/v1/pet/ws") as websocket:
+        ready = init_session(websocket)
+
+        websocket.send_text(
+            envelope(
+                "text.input",
+                {"text": "非法命令"},
+                request_id="req_invalid_command_block",
+                session_id=ready["session_id"],
+            )
+        )
+        events = receive_until_complete(websocket, limit=8)
+
+    text_event = next(event for event in events if event["type"] == "response.text")
+    assert text_event["payload"]["text"] == "回复继续。"
+    assert [event for event in events if event["type"] == "response.behavior"] == []
 
 
 def test_text_input_before_ready_returns_session_not_ready_error() -> None:

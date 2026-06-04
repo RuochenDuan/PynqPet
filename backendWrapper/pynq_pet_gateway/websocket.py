@@ -4,7 +4,9 @@ import base64
 import binascii
 from dataclasses import dataclass, field
 from enum import StrEnum
+import json
 from json import JSONDecodeError
+import re
 from typing import Any
 from uuid import uuid4
 
@@ -36,6 +38,73 @@ MAX_AUDIO_CHUNK_BASE64_CHARS = 4 * ((MAX_AUDIO_CHUNK_BYTES + 2) // 3)
 MAX_IMAGE_WIDTH = 320
 MAX_IMAGE_HEIGHT = 240
 SUPPORTED_IMAGE_MIME_TYPES = {"image/jpeg", "image/png"}
+PYNQ_EXPRESSIONS = {
+    "normal",
+    "happy",
+    "sad",
+    "hungry",
+    "sleepy",
+    "thinking",
+    "listening",
+    "remind",
+    "confused",
+}
+LEGACY_EXPRESSION_MAP = {
+    "neutral": "normal",
+    "joy": "happy",
+    "smirk": "happy",
+    "sadness": "sad",
+    "anger": "confused",
+    "disgust": "confused",
+    "fear": "confused",
+    "surprise": "confused",
+}
+EXPRESSION_TAG_PATTERN = re.compile(r"\[([A-Za-z][A-Za-z0-9_-]*)\]")
+PYNQ_COMMAND_BLOCK_PATTERN = re.compile(
+    r"<PYNQ_COMMANDS>(.*?)</PYNQ_COMMANDS>",
+    re.DOTALL,
+)
+PYNQ_COMMANDS = {
+    "ui.switch_screen",
+    "oled.display",
+    "camera.capture",
+    "time.speak_current",
+    "environment.speak_current",
+    "todo.manage",
+    "pet.update_status",
+    "tts.speak",
+}
+PYNQ_SCREEN_IDS = {
+    "home_screen",
+    "main_menu_screen",
+    "pet_status_screen",
+    "interaction_feedback_screen",
+    "voice_interaction_screen",
+    "todo_list_screen",
+    "todo_detail_screen",
+    "todo_confirm_screen",
+    "reminder_popup_screen",
+    "environment_screen",
+    "camera_capture_screen",
+    "settings_screen",
+    "error_status_screen",
+}
+OLED_CONTENT_TYPES = {
+    "text",
+    "expression",
+    "text_with_expression",
+    "reminder",
+    "error",
+}
+TODO_ACTIONS = {"create", "query", "update", "complete", "delete"}
+TODO_STATUSES = {"pending", "completed", "reminded"}
+PET_STATUS_DELTA_FIELDS = {
+    "mood_delta",
+    "satiety_delta",
+    "energy_delta",
+    "affinity_delta",
+    "health_delta",
+}
 
 
 class SessionState(StrEnum):
@@ -328,23 +397,21 @@ async def _handle_text_input(
 
     session.transition_to(SessionState.RESPONDING)
     for segment in result.segments:
+        text, behavior_payloads = _response_segment_content(segment, response_id)
         await websocket.send_json(
             build_event(
                 "response.text",
                 {
                     "response_id": response_id,
                     "turn_id": turn_id,
-                    "text": segment.text,
+                    "text": text,
                     "voice": segment.voice,
                 },
                 session_id=session.session_id,
                 request_id=envelope.request_id,
             )
         )
-        for behavior_payload in _behavior_payloads_from_actions(
-            segment.actions,
-            response_id,
-        ):
+        for behavior_payload in behavior_payloads:
             await websocket.send_json(
                 build_event(
                     "response.behavior",
@@ -562,23 +629,21 @@ async def _send_turn_result(
 
     session.transition_to(SessionState.RESPONDING)
     for segment in result.segments:
+        text, behavior_payloads = _response_segment_content(segment, response_id)
         await websocket.send_json(
             build_event(
                 "response.text",
                 {
                     "response_id": response_id,
                     "turn_id": turn_id,
-                    "text": segment.text,
+                    "text": text,
                     "voice": segment.voice,
                 },
                 session_id=session.session_id,
                 request_id=request_id,
             )
         )
-        for behavior_payload in _behavior_payloads_from_actions(
-            segment.actions,
-            response_id,
-        ):
+        for behavior_payload in behavior_payloads:
             await websocket.send_json(
                 build_event(
                     "response.behavior",
@@ -883,14 +948,75 @@ async def _close_upstream(upstream: UpstreamAdapter) -> None:
         await close()
 
 
+def _response_segment_content(segment: Any, response_id: str) -> tuple[str, list[dict[str, Any]]]:
+    text, command_payloads = _extract_pynq_command_blocks(segment.text, response_id)
+    text, tagged_expressions = _extract_expression_tags(text)
+    behavior_payloads = _behavior_payloads_from_actions(
+        segment.actions,
+        response_id,
+        extra_expressions=tagged_expressions,
+    )
+    behavior_payloads.extend(command_payloads)
+    return text, behavior_payloads
+
+
+def _extract_pynq_command_blocks(
+    text: str,
+    response_id: str,
+) -> tuple[str, list[dict[str, Any]]]:
+    if PYNQ_COMMAND_BLOCK_PATTERN.search(text) is None:
+        return text, []
+
+    payloads: list[dict[str, Any]] = []
+
+    def replace_block(match: re.Match[str]) -> str:
+        block = match.group(1).strip()
+        try:
+            commands = json.loads(block)
+        except JSONDecodeError:
+            return ""
+        if not isinstance(commands, list):
+            return ""
+        for command in commands:
+            payload = _behavior_payload_from_command(command, response_id)
+            if payload is not None:
+                payloads.append(payload)
+        return ""
+
+    cleaned = PYNQ_COMMAND_BLOCK_PATTERN.sub(replace_block, text)
+    cleaned = " ".join(cleaned.split())
+    return cleaned, payloads
+
+
+def _extract_expression_tags(text: str) -> tuple[str, list[str]]:
+    if EXPRESSION_TAG_PATTERN.search(text) is None:
+        return text, []
+
+    expressions: list[str] = []
+
+    def replace_tag(match: re.Match[str]) -> str:
+        expression = _canonical_pynq_expression(match.group(1))
+        if expression is not None and expression not in expressions:
+            expressions.append(expression)
+        return ""
+
+    cleaned = EXPRESSION_TAG_PATTERN.sub(replace_tag, text)
+    cleaned = " ".join(cleaned.split())
+    return cleaned, expressions
+
+
 def _behavior_payloads_from_actions(
     actions: dict[str, Any] | None,
     response_id: str,
+    *,
+    extra_expressions: list[str] | None = None,
 ) -> list[dict[str, Any]]:
-    if not isinstance(actions, dict):
-        return []
-
+    seen_expressions: set[str] = set()
     payloads: list[dict[str, Any]] = []
+
+    if not isinstance(actions, dict):
+        actions = {}
+
     commands = actions.get("commands")
     if isinstance(commands, list):
         for command in commands:
@@ -905,31 +1031,45 @@ def _behavior_payloads_from_actions(
     expressions = actions.get("expressions")
     if isinstance(expressions, list):
         for expression in expressions:
-            if isinstance(expression, str) and expression:
-                payloads.append(
-                    _make_behavior_payload(
-                        response_id,
-                        "oled.display",
-                        {
-                            "content_type": "expression",
-                            "expression": expression,
-                        },
-                    )
-                )
+            _append_expression_payload(payloads, seen_expressions, response_id, expression)
     expression = actions.get("expression")
-    if isinstance(expression, str) and expression:
-        payloads.append(
-            _make_behavior_payload(
-                response_id,
-                "oled.display",
-                {
-                    "content_type": "expression",
-                    "expression": expression,
-                },
-            )
-        )
+    _append_expression_payload(payloads, seen_expressions, response_id, expression)
+
+    if extra_expressions is not None:
+        for expression in extra_expressions:
+            _append_expression_payload(payloads, seen_expressions, response_id, expression)
 
     return payloads
+
+
+def _append_expression_payload(
+    payloads: list[dict[str, Any]],
+    seen_expressions: set[str],
+    response_id: str,
+    expression: Any,
+) -> None:
+    expression = _canonical_pynq_expression(expression)
+    if expression is None or expression in seen_expressions:
+        return
+    seen_expressions.add(expression)
+    payloads.append(
+        _make_behavior_payload(
+            response_id,
+            "oled.display",
+            {
+                "content_type": "expression",
+                "expression": expression,
+            },
+        )
+    )
+
+
+def _canonical_pynq_expression(expression: Any) -> str | None:
+    if not isinstance(expression, str):
+        return None
+    if expression in PYNQ_EXPRESSIONS:
+        return expression
+    return LEGACY_EXPRESSION_MAP.get(expression)
 
 
 def _behavior_payload_from_command(
@@ -939,12 +1079,119 @@ def _behavior_payload_from_command(
     if not isinstance(command, dict):
         return None
     command_name = command.get("command")
-    if not isinstance(command_name, str) or not command_name:
+    if not isinstance(command_name, str) or command_name not in PYNQ_COMMANDS:
         return None
     args = command.get("args", {})
     if not isinstance(args, dict):
-        args = {}
+        return None
+    args = _validated_command_args(command_name, args)
+    if args is None:
+        return None
     return _make_behavior_payload(response_id, command_name, args)
+
+
+def _validated_command_args(command_name: str, args: dict[str, Any]) -> dict[str, Any] | None:
+    args = dict(args)
+    if command_name == "ui.switch_screen":
+        return _validated_ui_switch_screen_args(args)
+    if command_name == "oled.display":
+        return _validated_oled_display_args(args)
+    if command_name == "camera.capture":
+        return {} if not args else None
+    if command_name in {"time.speak_current", "environment.speak_current"}:
+        return _validated_show_on_oled_args(args)
+    if command_name == "todo.manage":
+        return _validated_todo_manage_args(args)
+    if command_name == "pet.update_status":
+        return _validated_pet_update_status_args(args)
+    if command_name == "tts.speak":
+        return args
+    return None
+
+
+def _validated_ui_switch_screen_args(args: dict[str, Any]) -> dict[str, Any] | None:
+    screen_id = args.get("screen_id")
+    if not isinstance(screen_id, str) or screen_id not in PYNQ_SCREEN_IDS:
+        return None
+    validated: dict[str, Any] = {"screen_id": screen_id}
+    reason = args.get("reason")
+    if reason is not None:
+        if not isinstance(reason, str):
+            return None
+        validated["reason"] = reason
+    return validated
+
+
+def _validated_oled_display_args(args: dict[str, Any]) -> dict[str, Any] | None:
+    content_type = args.get("content_type")
+    if not isinstance(content_type, str) or content_type not in OLED_CONTENT_TYPES:
+        return None
+    validated: dict[str, Any] = {"content_type": content_type}
+    text = args.get("text")
+    if text is not None:
+        if not isinstance(text, str):
+            return None
+        validated["text"] = text
+    expression = args.get("expression")
+    if expression is not None:
+        expression = _canonical_pynq_expression(expression)
+        if expression is None:
+            return None
+        validated["expression"] = expression
+    duration_ms = args.get("duration_ms")
+    if duration_ms is not None:
+        if not _is_int(duration_ms):
+            return None
+        validated["duration_ms"] = duration_ms
+    return validated
+
+
+def _validated_show_on_oled_args(args: dict[str, Any]) -> dict[str, Any] | None:
+    show_on_oled = args.get("show_on_oled")
+    if show_on_oled is None:
+        return {}
+    if not isinstance(show_on_oled, bool):
+        return None
+    return {"show_on_oled": show_on_oled}
+
+
+def _validated_todo_manage_args(args: dict[str, Any]) -> dict[str, Any] | None:
+    action = args.get("action")
+    if not isinstance(action, str) or action not in TODO_ACTIONS:
+        return None
+    validated: dict[str, Any] = {"action": action}
+    for arg_name in ("todo_id", "title", "remind_time"):
+        value = args.get(arg_name)
+        if value is not None:
+            if not isinstance(value, str):
+                return None
+            validated[arg_name] = value
+    status = args.get("status")
+    if status is not None:
+        if not isinstance(status, str) or status not in TODO_STATUSES:
+            return None
+        validated["status"] = status
+    return validated
+
+
+def _validated_pet_update_status_args(args: dict[str, Any]) -> dict[str, Any] | None:
+    validated: dict[str, Any] = {}
+    for arg_name in PET_STATUS_DELTA_FIELDS:
+        value = args.get(arg_name)
+        if value is not None:
+            if not _is_int(value):
+                return None
+            validated[arg_name] = value
+    status_text = args.get("status_text")
+    if status_text is not None:
+        if not isinstance(status_text, str):
+            return None
+        validated["status_text"] = status_text
+    return validated
+
+
+def _is_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
 
 
 def _make_behavior_payload(
