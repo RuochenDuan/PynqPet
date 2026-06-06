@@ -30,6 +30,11 @@ class FakeOpenLlmWebSocket:
         self.closed = True
 
 
+class SendFailingOpenLlmWebSocket(FakeOpenLlmWebSocket):
+    async def send(self, raw: str) -> None:
+        raise RuntimeError("upstream connection closed")
+
+
 async def _sleep_forever() -> None:
     import asyncio
 
@@ -82,6 +87,101 @@ async def test_open_llm_ws_adapter_sends_text_input_and_normalizes_full_text() -
     await adapter.close()
 
     assert fake.closed is True
+
+
+@pytest.mark.asyncio
+async def test_open_llm_ws_adapter_sends_text_input_with_images() -> None:
+    image = {
+        "source": "camera",
+        "data": "data:image/jpeg;base64,AAECAw==",
+        "mime_type": "image/jpeg",
+    }
+    fake = FakeOpenLlmWebSocket(
+        [
+            {"type": "full-text", "text": "我看到了图片。"},
+            {"type": "backend-synth-complete"},
+        ]
+    )
+    adapter = OpenLlmWebSocketAdapter(
+        "ws://example.test/client-ws",
+        connect=make_connect(fake),
+        receive_timeout_s=0.01,
+        initial_drain_timeout_s=0.01,
+    )
+
+    result = await adapter.start_text_turn("请看图", images=[image])
+
+    assert fake.sent[0] == {
+        "type": "text-input",
+        "text": "请看图",
+        "images": [image],
+    }
+    assert [segment.text for segment in result.segments] == ["我看到了图片。"]
+
+
+@pytest.mark.asyncio
+async def test_open_llm_ws_adapter_wraps_send_failures() -> None:
+    fake = SendFailingOpenLlmWebSocket([])
+    adapter = OpenLlmWebSocketAdapter(
+        "ws://example.test/client-ws",
+        connect=make_connect(fake),
+        receive_timeout_s=0.01,
+        initial_drain_timeout_s=0.01,
+    )
+
+    with pytest.raises(UpstreamBridgeError) as exc_info:
+        await adapter.start_text_turn(
+            "请看图",
+            images=[
+                {
+                    "source": "camera",
+                    "data": "data:image/jpeg;base64,AAECAw==",
+                    "mime_type": "image/jpeg",
+                }
+            ],
+        )
+
+    assert "Open-LLM WebSocket send failed" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_open_llm_ws_adapter_reconnects_once_before_text_turn() -> None:
+    stale_fake = SendFailingOpenLlmWebSocket([])
+    fresh_fake = FakeOpenLlmWebSocket(
+        [
+            {"type": "full-text", "text": "我看到了图片。"},
+            {"type": "backend-synth-complete"},
+        ]
+    )
+    connected = []
+
+    async def connect(url: str):
+        fake = stale_fake if not connected else fresh_fake
+        connected.append(fake)
+        return fake
+
+    adapter = OpenLlmWebSocketAdapter(
+        "ws://example.test/client-ws",
+        connect=connect,
+        receive_timeout_s=0.01,
+        initial_drain_timeout_s=0.01,
+    )
+
+    result = await adapter.start_text_turn(
+        "请看图",
+        images=[
+            {
+                "source": "camera",
+                "data": "data:image/jpeg;base64,AAECAw==",
+                "mime_type": "image/jpeg",
+            }
+        ],
+    )
+
+    assert connected == [stale_fake, fresh_fake]
+    assert fresh_fake.sent[0]["type"] == "text-input"
+    assert fresh_fake.sent[0]["images"][0]["source"] == "camera"
+    assert [segment.text for segment in result.segments] == ["我看到了图片。"]
 
 
 @pytest.mark.asyncio

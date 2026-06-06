@@ -126,6 +126,7 @@ class PetSession:
     config_id: str | None = None
     last_audio_seq: int | None = None
     latest_image: dict[str, Any] | None = None
+    pending_image_request: dict[str, Any] | None = None
     latest_sensor: dict[str, Any] | None = None
     behavior_events: list[dict[str, Any]] | None = None
     behavior_event_count: int = 0
@@ -199,7 +200,7 @@ async def pet_ws(websocket: WebSocket) -> None:
                 await _handle_audio_chunk(websocket, session, envelope, upstream)
         elif envelope.type == "image.upload":
             if await _ensure_ready_session(websocket, session, envelope):
-                await _handle_image_upload(websocket, session, envelope)
+                await _handle_image_upload(websocket, session, envelope, upstream)
         elif envelope.type == "sensor.report":
             if await _ensure_ready_session(websocket, session, envelope):
                 session.latest_sensor = dict(envelope.payload)
@@ -331,7 +332,7 @@ async def _handle_session_init(
                 "server_capabilities": {
                     "vad": False,
                     "asr": False,
-                    "vision_context": False,
+                    "vision_context": True,
                     "behavior_planning": False,
                 },
             },
@@ -377,8 +378,9 @@ async def _handle_text_input(
     )
     await _send_status(websocket, session, envelope.request_id, "thinking")
 
+    user_text = envelope.payload.get("text", "")
     try:
-        result = await upstream.start_text_turn(envelope.payload.get("text", ""))
+        result = await _start_text_turn(upstream, user_text)
     except UpstreamBridgeError as exc:
         session.active_turn_id = None
         session.active_response_id = None
@@ -414,6 +416,7 @@ async def _handle_text_input(
                 )
             )
         for behavior_payload in behavior_payloads:
+            _remember_camera_capture_request(session, behavior_payload, user_text)
             await websocket.send_json(
                 build_event(
                     "response.behavior",
@@ -423,6 +426,7 @@ async def _handle_text_input(
                 )
             )
     for behavior_payload in segment_processor.flush():
+        _remember_camera_capture_request(session, behavior_payload, user_text)
         await websocket.send_json(
             build_event(
                 "response.behavior",
@@ -499,7 +503,7 @@ async def _handle_audio_chunk(
 
     try:
         audio_bytes = base64.b64decode(audio_base64, validate=True)
-    except binascii.Error:
+    except (binascii.Error, ValueError):
         await websocket.send_json(
             build_error(
                 ErrorCode.INVALID_MESSAGE,
@@ -622,6 +626,7 @@ async def _send_turn_result(
     result,
     *,
     trigger: str,
+    source_text: str | None = None,
 ) -> None:
     turn_id = f"turn_{uuid4().hex}"
     response_id = f"rsp_{uuid4().hex}"
@@ -657,6 +662,7 @@ async def _send_turn_result(
                 )
             )
         for behavior_payload in behavior_payloads:
+            _remember_camera_capture_request(session, behavior_payload, source_text)
             await websocket.send_json(
                 build_event(
                     "response.behavior",
@@ -666,6 +672,7 @@ async def _send_turn_result(
                 )
             )
     for behavior_payload in segment_processor.flush():
+        _remember_camera_capture_request(session, behavior_payload, source_text)
         await websocket.send_json(
             build_event(
                 "response.behavior",
@@ -691,7 +698,12 @@ async def _send_turn_result(
     )
 
 
-async def _handle_image_upload(websocket: WebSocket, session: PetSession, envelope) -> None:
+async def _handle_image_upload(
+    websocket: WebSocket,
+    session: PetSession,
+    envelope,
+    upstream: UpstreamAdapter,
+) -> None:
     payload = envelope.payload
     mime_type = payload.get("mime_type")
     if mime_type not in SUPPORTED_IMAGE_MIME_TYPES:
@@ -735,7 +747,7 @@ async def _handle_image_upload(websocket: WebSocket, session: PetSession, envelo
 
     try:
         image_bytes = base64.b64decode(data_base64, validate=True)
-    except binascii.Error:
+    except (binascii.Error, ValueError):
         await websocket.send_json(
             build_error(
                 ErrorCode.INVALID_MESSAGE,
@@ -775,15 +787,55 @@ async def _handle_image_upload(websocket: WebSocket, session: PetSession, envelo
         )
         return
 
-    session.latest_image = {
+    image_context = {
         "image_id": payload.get("image_id"),
-        "source": payload.get("source"),
+        "source": "camera" if payload.get("source") == "camera" else "upload",
         "mime_type": mime_type,
+        "data": f"data:{mime_type};base64,{data_base64}",
         "width": width,
         "height": height,
         "sampled_at": payload.get("sampled_at"),
     }
+    session.latest_image = image_context
     await _send_status(websocket, session, envelope.request_id, "image_received")
+
+    if session.pending_image_request is None or session.active_turn_id is not None:
+        return
+
+    pending_request = session.pending_image_request
+    session.pending_image_request = None
+    session.latest_image = None
+    user_text = pending_request.get("user_text") or "用户请求使用摄像头查看当前画面"
+    prompt = f"用户刚刚请求：{user_text}\n这是摄像头刚拍到的图片，请根据图片回答用户。"
+    upstream_image = {
+        "source": image_context["source"],
+        "data": image_context["data"],
+        "mime_type": image_context["mime_type"],
+    }
+
+    try:
+        result = await _start_text_turn(upstream, prompt, images=[upstream_image])
+    except UpstreamBridgeError as exc:
+        session.transition_to(SessionState.IDLE)
+        await websocket.send_json(
+            build_error(
+                ErrorCode.UPSTREAM_AGENT_ERROR,
+                str(exc),
+                retryable=True,
+                request_id=envelope.request_id,
+                session_id=session.session_id,
+                field="upstream",
+            )
+        )
+        return
+
+    await _send_turn_result(
+        websocket,
+        session,
+        envelope.request_id,
+        result,
+        trigger="image",
+    )
 
 
 async def _handle_interrupt(
@@ -868,6 +920,31 @@ async def _stream_audio_chunk(
     if stream_audio_chunk is None:
         return AudioChunkResult()
     return await stream_audio_chunk(audio_bytes)
+
+
+async def _start_text_turn(
+    upstream: UpstreamAdapter,
+    text: str,
+    *,
+    images: list[dict[str, Any]] | None = None,
+):
+    if images:
+        return await upstream.start_text_turn(text, images=images)
+    return await upstream.start_text_turn(text)
+
+
+def _remember_camera_capture_request(
+    session: PetSession,
+    behavior_payload: dict[str, Any],
+    user_text: str | None,
+) -> None:
+    if behavior_payload.get("command") != "camera.capture" or not user_text:
+        return
+    session.pending_image_request = {
+        "user_text": user_text,
+        "response_id": behavior_payload.get("response_id"),
+        "command_id": behavior_payload.get("command_id"),
+    }
 
 
 async def _ensure_ready_session(

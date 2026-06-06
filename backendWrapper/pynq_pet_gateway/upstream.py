@@ -38,7 +38,11 @@ class UpstreamBridgeError(Exception):
 
 
 class UpstreamAdapter(Protocol):
-    async def start_text_turn(self, text: str) -> TextTurnResult:
+    async def start_text_turn(
+        self,
+        text: str,
+        images: list[dict[str, Any]] | None = None,
+    ) -> TextTurnResult:
         """Start a text turn through the upstream agent boundary."""
 
     async def start_audio_turn(self, audio_pcm: bytes) -> TextTurnResult:
@@ -55,7 +59,11 @@ class UpstreamAdapter(Protocol):
 
 
 class PlaceholderUpstreamAdapter:
-    async def start_text_turn(self, text: str) -> TextTurnResult:
+    async def start_text_turn(
+        self,
+        text: str,
+        images: list[dict[str, Any]] | None = None,
+    ) -> TextTurnResult:
         return TextTurnResult(segments=[TextSegment(text="我收到你的消息了。")])
 
     async def start_audio_turn(self, audio_pcm: bytes) -> TextTurnResult:
@@ -93,33 +101,40 @@ class OpenLlmWebSocketAdapter:
         self._websocket: Any | None = None
         self._pending_messages: list[dict[str, Any]] = []
 
-    async def start_text_turn(self, text: str) -> TextTurnResult:
-        websocket = await self._ensure_websocket()
-        await websocket.send(json.dumps({"type": "text-input", "text": text, "images": []}))
+    async def start_text_turn(
+        self,
+        text: str,
+        images: list[dict[str, Any]] | None = None,
+    ) -> TextTurnResult:
+        websocket = await self._send_json_with_reconnect(
+            {
+                "type": "text-input",
+                "text": text,
+                "images": images or [],
+            },
+        )
         return await self._collect_text_turn(websocket)
 
     async def start_audio_turn(self, audio_pcm: bytes) -> TextTurnResult:
         websocket = await self._ensure_websocket()
-        await websocket.send(
-            json.dumps(
-                {
-                    "type": "mic-audio-data",
-                    "audio": _pcm_s16le_to_float_list(audio_pcm),
-                }
-            )
+        await self._send_json(
+            websocket,
+            {
+                "type": "mic-audio-data",
+                "audio": _pcm_s16le_to_float_list(audio_pcm),
+            },
         )
-        await websocket.send(json.dumps({"type": "mic-audio-end"}))
+        await self._send_json(websocket, {"type": "mic-audio-end"})
         return await self._collect_text_turn(websocket)
 
     async def stream_audio_chunk(self, audio_pcm: bytes) -> AudioChunkResult:
         websocket = await self._ensure_websocket()
-        await websocket.send(
-            json.dumps(
-                {
-                    "type": "raw-audio-data",
-                    "audio": _pcm_s16le_to_float_list(audio_pcm),
-                }
-            )
+        await self._send_json(
+            websocket,
+            {
+                "type": "raw-audio-data",
+                "audio": _pcm_s16le_to_float_list(audio_pcm),
+            },
         )
         try:
             message = await self._read_next_message(
@@ -134,7 +149,7 @@ class OpenLlmWebSocketAdapter:
             if control_text == "interrupt":
                 return AudioChunkResult(interrupted=True)
             if control_text == "mic-audio-end":
-                await websocket.send(json.dumps({"type": "mic-audio-end"}))
+                await self._send_json(websocket, {"type": "mic-audio-end"})
                 return AudioChunkResult(turn=await self._collect_text_turn(websocket))
             return AudioChunkResult()
         if message.get("type") == "error":
@@ -146,7 +161,7 @@ class OpenLlmWebSocketAdapter:
 
     async def interrupt_turn(self, turn_id: str, reason: str) -> None:
         websocket = await self._ensure_websocket()
-        await websocket.send(json.dumps({"type": "interrupt-signal", "text": ""}))
+        await self._send_json(websocket, {"type": "interrupt-signal", "text": ""})
 
     async def close(self) -> None:
         websocket = self._websocket
@@ -176,6 +191,12 @@ class OpenLlmWebSocketAdapter:
                 )
             except TimeoutError:
                 return pending_messages
+            except Exception as exc:
+                self._websocket = None
+                self._pending_messages = []
+                raise UpstreamBridgeError(
+                    f"Open-LLM WebSocket receive failed: {exc}"
+                ) from exc
             message = _decode_message(raw)
             if _is_actionable_message(message):
                 pending_messages.append(message)
@@ -184,8 +205,38 @@ class OpenLlmWebSocketAdapter:
     async def _read_next_message(self, websocket: Any, *, timeout: float) -> dict[str, Any]:
         if self._pending_messages:
             return self._pending_messages.pop(0)
-        raw = await asyncio.wait_for(websocket.recv(), timeout=timeout)
+        try:
+            raw = await asyncio.wait_for(websocket.recv(), timeout=timeout)
+        except TimeoutError:
+            raise
+        except Exception as exc:
+            self._websocket = None
+            self._pending_messages = []
+            raise UpstreamBridgeError(
+                f"Open-LLM WebSocket receive failed: {exc}"
+            ) from exc
         return _decode_message(raw)
+
+    async def _send_json(self, websocket: Any, payload: dict[str, Any]) -> None:
+        try:
+            await websocket.send(json.dumps(payload))
+        except Exception as exc:
+            self._websocket = None
+            self._pending_messages = []
+            raise UpstreamBridgeError(
+                f"Open-LLM WebSocket send failed: {exc}"
+            ) from exc
+
+    async def _send_json_with_reconnect(self, payload: dict[str, Any]) -> Any:
+        websocket = await self._ensure_websocket()
+        try:
+            await self._send_json(websocket, payload)
+            return websocket
+        except UpstreamBridgeError:
+            await _close_websocket(websocket)
+            websocket = await self._ensure_websocket()
+            await self._send_json(websocket, payload)
+            return websocket
 
     async def _collect_text_turn(
         self,
@@ -205,7 +256,7 @@ class OpenLlmWebSocketAdapter:
                     raise UpstreamBridgeError("Timed out waiting for Open-LLM response") from exc
             message_type = message.get("type")
             if message_type == "backend-synth-complete":
-                await websocket.send(json.dumps({"type": "frontend-playback-complete"}))
+                await self._send_json(websocket, {"type": "frontend-playback-complete"})
                 return TextTurnResult(segments=segments)
             if message_type == "error":
                 raise UpstreamBridgeError(str(message.get("message") or "Open-LLM error"))

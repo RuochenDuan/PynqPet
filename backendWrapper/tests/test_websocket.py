@@ -269,7 +269,7 @@ def test_session_init_uses_default_config_and_reports_ready_capabilities() -> No
         "server_capabilities": {
             "vad": False,
             "asr": False,
-            "vision_context": False,
+            "vision_context": True,
             "behavior_planning": False,
         },
     }
@@ -673,6 +673,162 @@ def test_text_input_with_pynq_command_block_sends_behavior_and_cleans_text(
     assert text_event["payload"]["text"] == "我来拍一张照片。"
     assert behavior["payload"]["command"] == "camera.capture"
     assert behavior["payload"]["args"] == {}
+
+
+def test_image_upload_after_camera_capture_auto_triggers_vision_turn(
+    monkeypatch,
+) -> None:
+    from pynq_pet_gateway import websocket as websocket_module
+
+    class CameraThenVisionAdapter:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, list[dict] | None]] = []
+
+        async def start_text_turn(self, text: str, images=None):
+            self.calls.append((text, images))
+            if len(self.calls) == 1:
+                return TextTurnResult(
+                    segments=[
+                        TextSegment(
+                            text=(
+                                "我来拍一张照片。"
+                                "<PYNQ_COMMANDS>"
+                                '[{"command":"camera.capture","args":{}}]'
+                                "</PYNQ_COMMANDS>"
+                            )
+                        )
+                    ]
+                )
+            return TextTurnResult(segments=[TextSegment(text="我看到了图片。")])
+
+        async def interrupt_turn(self, turn_id: str, reason: str) -> None:
+            return None
+
+    adapter = CameraThenVisionAdapter()
+    monkeypatch.setattr(
+        websocket_module,
+        "create_upstream_adapter",
+        lambda: adapter,
+    )
+
+    with client.websocket_connect("/api/v1/pet/ws") as websocket:
+        ready = init_session(websocket)
+
+        websocket.send_text(
+            envelope(
+                "text.input",
+                {"text": "你用摄像头看看我"},
+                request_id="req_camera",
+                session_id=ready["session_id"],
+            )
+        )
+        first_turn_events = receive_until_complete(websocket, limit=8)
+        camera_behavior = next(
+            event
+            for event in first_turn_events
+            if event["type"] == "response.behavior"
+            and event["payload"]["command"] == "camera.capture"
+        )
+        first_complete = first_turn_events[-1]
+        first_waiting = websocket.receive_json()
+
+        websocket.send_text(
+            envelope(
+                "client.tts.finished",
+                {"response_id": first_complete["payload"]["response_id"]},
+                request_id="req_first_tts_finished",
+                session_id=ready["session_id"],
+            )
+        )
+        first_idle = websocket.receive_json()
+
+        websocket.send_text(
+            envelope(
+                "image.upload",
+                image_upload(data_base64="AAECAw=="),
+                request_id="req_image",
+                session_id=ready["session_id"],
+            )
+        )
+        image_status = websocket.receive_json()
+        vision_events = receive_until_complete(websocket, limit=8)
+
+        second_complete = next(
+            event for event in vision_events if event["type"] == "response.complete"
+        )
+        second_waiting = websocket.receive_json()
+        websocket.send_text(
+            envelope(
+                "client.tts.finished",
+                {"response_id": second_complete["payload"]["response_id"]},
+                request_id="req_second_tts_finished",
+                session_id=ready["session_id"],
+            )
+        )
+        second_idle = websocket.receive_json()
+
+        websocket.send_text(
+            envelope(
+                "text.input",
+                {"text": "继续"},
+                request_id="req_after_image",
+                session_id=ready["session_id"],
+            )
+        )
+        receive_until_complete(websocket, limit=8)
+
+    assert camera_behavior["payload"]["args"] == {}
+    assert_status_update(
+        first_waiting,
+        stage="waiting_client_playback",
+        state="waiting_client_playback",
+        request_id="req_camera",
+        session_id=ready["session_id"],
+    )
+    assert_status_update(
+        first_idle,
+        stage="client_tts_finished",
+        state="idle",
+        request_id="req_first_tts_finished",
+        session_id=ready["session_id"],
+    )
+    assert_status_update(
+        image_status,
+        stage="image_received",
+        state="idle",
+        request_id="req_image",
+        session_id=ready["session_id"],
+    )
+    assert vision_events[0]["type"] == "conversation.started"
+    assert vision_events[0]["payload"]["trigger"] == "image"
+    assert [event["type"] for event in vision_events if event["type"] == "response.text"]
+    assert_status_update(
+        second_waiting,
+        stage="waiting_client_playback",
+        state="waiting_client_playback",
+        request_id="req_image",
+        session_id=ready["session_id"],
+    )
+    assert_status_update(
+        second_idle,
+        stage="client_tts_finished",
+        state="idle",
+        request_id="req_second_tts_finished",
+        session_id=ready["session_id"],
+    )
+    assert adapter.calls[0] == ("你用摄像头看看我", None)
+    assert adapter.calls[1][0] == (
+        "用户刚刚请求：你用摄像头看看我\n"
+        "这是摄像头刚拍到的图片，请根据图片回答用户。"
+    )
+    assert adapter.calls[1][1] == [
+        {
+            "source": "camera",
+            "data": "data:image/jpeg;base64,AAECAw==",
+            "mime_type": "image/jpeg",
+        }
+    ]
+    assert adapter.calls[2] == ("继续", None)
 
 
 def test_text_input_with_split_pynq_command_block_buffers_until_closed(
@@ -1340,6 +1496,24 @@ def test_invalid_image_base64_returns_invalid_message() -> None:
         event = websocket.receive_json()
 
     assert_error_code(event, "INVALID_MESSAGE", "req_bad_image")
+    assert event["payload"]["field"] == "data_base64"
+
+
+def test_non_ascii_image_base64_returns_invalid_message() -> None:
+    with client.websocket_connect("/api/v1/pet/ws") as websocket:
+        ready = init_session(websocket)
+
+        websocket.send_text(
+            envelope(
+                "image.upload",
+                image_upload(data_base64="\ufeffAAECAw=="),
+                request_id="req_non_ascii_image",
+                session_id=ready["session_id"],
+            )
+        )
+        event = websocket.receive_json()
+
+    assert_error_code(event, "INVALID_MESSAGE", "req_non_ascii_image")
     assert event["payload"]["field"] == "data_base64"
 
 
