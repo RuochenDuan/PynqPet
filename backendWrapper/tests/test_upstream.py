@@ -35,6 +35,35 @@ class SendFailingOpenLlmWebSocket(FakeOpenLlmWebSocket):
         raise RuntimeError("upstream connection closed")
 
 
+class ControlledOpenLlmWebSocket:
+    def __init__(self, messages: list[dict]) -> None:
+        self._messages: asyncio.Queue[str] = asyncio.Queue()
+        for message in messages:
+            self._messages.put_nowait(json.dumps(message))
+        self.sent: list[dict] = []
+        self.closed = False
+        self.active_recvs = 0
+        self.concurrent_recv_detected = False
+
+    async def send(self, raw: str) -> None:
+        self.sent.append(json.loads(raw))
+
+    async def recv(self) -> str:
+        self.active_recvs += 1
+        if self.active_recvs > 1:
+            self.concurrent_recv_detected = True
+        try:
+            return await self._messages.get()
+        finally:
+            self.active_recvs -= 1
+
+    async def close(self) -> None:
+        self.closed = True
+
+    def push(self, message: dict) -> None:
+        self._messages.put_nowait(json.dumps(message))
+
+
 async def _sleep_forever() -> None:
     import asyncio
 
@@ -204,6 +233,82 @@ async def test_open_llm_ws_adapter_waits_for_previous_turn_before_next_text() ->
         "第一",
         "第二",
     ]
+
+
+@pytest.mark.asyncio
+async def test_open_llm_ws_adapter_serializes_concurrent_turns_during_settle() -> None:
+    fake = ControlledOpenLlmWebSocket(
+        [
+            {"type": "full-text", "text": "first"},
+            {"type": "backend-synth-complete"},
+        ]
+    )
+    adapter = OpenLlmWebSocketAdapter(
+        "ws://example.test/client-ws",
+        connect=make_connect(fake),
+        receive_timeout_s=0.01,
+        initial_drain_timeout_s=0.01,
+        turn_settle_timeout_s=1.0,
+    )
+
+    first = await adapter.start_text_turn("first")
+    await wait_until(lambda: fake.active_recvs == 1)
+
+    second_task = asyncio.create_task(adapter.start_text_turn("second"))
+    third_task = asyncio.create_task(adapter.start_text_turn("third"))
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert [message["text"] for message in fake.sent if message["type"] == "text-input"] == [
+        "first"
+    ]
+    assert fake.concurrent_recv_detected is False
+
+    fake.push({"type": "control", "text": "conversation-chain-end"})
+    fake.push({"type": "full-text", "text": "second"})
+    fake.push({"type": "backend-synth-complete"})
+    fake.push({"type": "control", "text": "conversation-chain-end"})
+    fake.push({"type": "full-text", "text": "third"})
+    fake.push({"type": "backend-synth-complete"})
+    fake.push({"type": "control", "text": "conversation-chain-end"})
+
+    second = await asyncio.wait_for(second_task, timeout=0.1)
+    third = await asyncio.wait_for(third_task, timeout=0.1)
+
+    assert [segment.text for segment in first.segments] == ["first"]
+    assert [segment.text for segment in second.segments] == ["second"]
+    assert [segment.text for segment in third.segments] == ["third"]
+    assert [message["text"] for message in fake.sent if message["type"] == "text-input"] == [
+        "first",
+        "second",
+        "third",
+    ]
+    assert fake.concurrent_recv_detected is False
+
+
+@pytest.mark.asyncio
+async def test_open_llm_ws_adapter_close_cancels_background_settle() -> None:
+    fake = ControlledOpenLlmWebSocket(
+        [
+            {"type": "full-text", "text": "first"},
+            {"type": "backend-synth-complete"},
+        ]
+    )
+    adapter = OpenLlmWebSocketAdapter(
+        "ws://example.test/client-ws",
+        connect=make_connect(fake),
+        receive_timeout_s=0.01,
+        initial_drain_timeout_s=0.01,
+        turn_settle_timeout_s=1.0,
+    )
+
+    result = await adapter.start_text_turn("first")
+    await wait_until(lambda: fake.active_recvs == 1)
+
+    await asyncio.wait_for(adapter.close(), timeout=0.1)
+
+    assert [segment.text for segment in result.segments] == ["first"]
+    assert fake.closed is True
 
 
 @pytest.mark.asyncio

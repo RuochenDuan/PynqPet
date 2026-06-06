@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import struct
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Protocol
 
@@ -106,80 +107,86 @@ class OpenLlmWebSocketAdapter:
         self._websocket: Any | None = None
         self._pending_messages: list[dict[str, Any]] = []
         self._settle_task: asyncio.Task[None] | None = None
+        self._operation_lock = asyncio.Lock()
 
     async def start_text_turn(
         self,
         text: str,
         images: list[dict[str, Any]] | None = None,
     ) -> TextTurnResult:
-        await self._wait_for_settle()
-        websocket = await self._send_json_with_reconnect(
-            {
-                "type": "text-input",
-                "text": text,
-                "images": images or [],
-            },
-        )
-        return await self._collect_text_turn(websocket)
+        async with self._operation_lock:
+            await self._wait_for_settle()
+            websocket = await self._send_json_with_reconnect(
+                {
+                    "type": "text-input",
+                    "text": text,
+                    "images": images or [],
+                },
+            )
+            return await self._collect_text_turn(websocket)
 
     async def start_audio_turn(self, audio_pcm: bytes) -> TextTurnResult:
-        await self._wait_for_settle()
-        websocket = await self._ensure_websocket()
-        await self._send_json(
-            websocket,
-            {
-                "type": "mic-audio-data",
-                "audio": _pcm_s16le_to_float_list(audio_pcm),
-            },
-        )
-        await self._send_json(websocket, {"type": "mic-audio-end"})
-        return await self._collect_text_turn(websocket)
+        async with self._operation_lock:
+            await self._wait_for_settle()
+            websocket = await self._ensure_websocket()
+            await self._send_json(
+                websocket,
+                {
+                    "type": "mic-audio-data",
+                    "audio": _pcm_s16le_to_float_list(audio_pcm),
+                },
+            )
+            await self._send_json(websocket, {"type": "mic-audio-end"})
+            return await self._collect_text_turn(websocket)
 
     async def stream_audio_chunk(self, audio_pcm: bytes) -> AudioChunkResult:
-        await self._wait_for_settle()
-        websocket = await self._ensure_websocket()
-        await self._send_json(
-            websocket,
-            {
-                "type": "raw-audio-data",
-                "audio": _pcm_s16le_to_float_list(audio_pcm),
-            },
-        )
-        try:
-            message = await self._read_next_message(
+        async with self._operation_lock:
+            await self._wait_for_settle()
+            websocket = await self._ensure_websocket()
+            await self._send_json(
                 websocket,
-                timeout=self._audio_control_timeout_s,
+                {
+                    "type": "raw-audio-data",
+                    "audio": _pcm_s16le_to_float_list(audio_pcm),
+                },
             )
-        except TimeoutError:
-            return AudioChunkResult()
+            try:
+                message = await self._read_next_message(
+                    websocket,
+                    timeout=self._audio_control_timeout_s,
+                )
+            except TimeoutError:
+                return AudioChunkResult()
 
-        if message.get("type") == "control":
-            control_text = message.get("text")
-            if control_text == "interrupt":
-                return AudioChunkResult(interrupted=True)
-            if control_text == "mic-audio-end":
-                await self._send_json(websocket, {"type": "mic-audio-end"})
+            if message.get("type") == "control":
+                control_text = message.get("text")
+                if control_text == "interrupt":
+                    return AudioChunkResult(interrupted=True)
+                if control_text == "mic-audio-end":
+                    await self._send_json(websocket, {"type": "mic-audio-end"})
+                    return AudioChunkResult(turn=await self._collect_text_turn(websocket))
+                return AudioChunkResult()
+            if message.get("type") == "error":
+                raise UpstreamBridgeError(str(message.get("message") or "Open-LLM error"))
+            if _is_turn_message(message):
+                self._pending_messages.append(message)
                 return AudioChunkResult(turn=await self._collect_text_turn(websocket))
             return AudioChunkResult()
-        if message.get("type") == "error":
-            raise UpstreamBridgeError(str(message.get("message") or "Open-LLM error"))
-        if _is_turn_message(message):
-            self._pending_messages.append(message)
-            return AudioChunkResult(turn=await self._collect_text_turn(websocket))
-        return AudioChunkResult()
 
     async def interrupt_turn(self, turn_id: str, reason: str) -> None:
-        await self._wait_for_settle()
-        websocket = await self._ensure_websocket()
-        await self._send_json(websocket, {"type": "interrupt-signal", "text": ""})
+        async with self._operation_lock:
+            await self._wait_for_settle()
+            websocket = await self._ensure_websocket()
+            await self._send_json(websocket, {"type": "interrupt-signal", "text": ""})
 
     async def close(self) -> None:
-        await self._wait_for_settle()
-        websocket = self._websocket
-        self._websocket = None
-        self._pending_messages = []
-        if websocket is not None:
-            await _close_websocket(websocket)
+        async with self._operation_lock:
+            await self._cancel_settle_task()
+            websocket = self._websocket
+            self._websocket = None
+            self._pending_messages = []
+            if websocket is not None:
+                await _close_websocket(websocket)
 
     async def _ensure_websocket(self) -> Any:
         if self._websocket is not None:
@@ -262,6 +269,15 @@ class OpenLlmWebSocketAdapter:
             self._pending_messages = []
             if websocket is not None:
                 await _close_websocket(websocket)
+
+    async def _cancel_settle_task(self) -> None:
+        task = self._settle_task
+        if task is None:
+            return
+        self._settle_task = None
+        task.cancel()
+        with suppress(asyncio.CancelledError, UpstreamBridgeError):
+            await task
 
     async def _collect_text_turn(
         self,
