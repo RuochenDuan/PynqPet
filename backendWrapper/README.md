@@ -1,18 +1,7 @@
-# Pynq Pet Gateway
+# 启动
 
-FastAPI wrapper service for the Pynq pet client protocol.
-
-## Run
-
-```powershell
-uv run uvicorn main:app --host 0.0.0.0 --port 8000 --reload
-```
-
-## Test
-
-```powershell
-$env:UV_NO_CACHE='1'
-$env:UV_CACHE_DIR='.uv-cache'
-uv run python -m pytest -p no:cacheprovider
-uv run ruff check .
+```bash
+$env:PYNQ_PET_UPSTREAM_MODE='open_llm_ws'
+$env:PYNQ_PET_OPEN_LLM_WS_URL='ws://127.0.0.1:12393/client-ws'
+uv run uvicorn main:app --host 127.0.0.1 --port 8000
 ```
