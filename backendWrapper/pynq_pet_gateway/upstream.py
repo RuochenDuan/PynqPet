@@ -13,6 +13,9 @@ UPSTREAM_MODE_ENV = "PYNQ_PET_UPSTREAM_MODE"
 OPEN_LLM_WS_URL_ENV = "PYNQ_PET_OPEN_LLM_WS_URL"
 DEFAULT_OPEN_LLM_WS_URL = "ws://127.0.0.1:12393/client-ws"
 IGNORED_FULL_TEXTS = {"Connection established", "Thinking..."}
+CONVERSATION_CHAIN_END = "conversation-chain-end"
+IGNORED_CONTROL_TEXTS = {"conversation-chain-start"}
+IGNORED_MESSAGE_TYPES = {"force-new-message"}
 
 
 @dataclass(frozen=True)
@@ -257,7 +260,19 @@ class OpenLlmWebSocketAdapter:
             message_type = message.get("type")
             if message_type == "backend-synth-complete":
                 await self._send_json(websocket, {"type": "frontend-playback-complete"})
+                continue
+            if (
+                message_type == "control"
+                and message.get("text") == CONVERSATION_CHAIN_END
+            ):
                 return TextTurnResult(segments=segments)
+            if (
+                message_type == "control"
+                and message.get("text") in IGNORED_CONTROL_TEXTS
+            ):
+                continue
+            if message_type in IGNORED_MESSAGE_TYPES:
+                continue
             if message_type == "error":
                 raise UpstreamBridgeError(str(message.get("message") or "Open-LLM error"))
 

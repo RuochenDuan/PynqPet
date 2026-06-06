@@ -67,6 +67,8 @@ async def test_open_llm_ws_adapter_sends_text_input_and_normalizes_full_text() -
             {"type": "full-text", "text": "Thinking..."},
             {"type": "full-text", "text": "你好，我在。"},
             {"type": "backend-synth-complete"},
+            {"type": "force-new-message"},
+            {"type": "control", "text": "conversation-chain-end"},
         ]
     )
     adapter = OpenLlmWebSocketAdapter(
@@ -100,6 +102,7 @@ async def test_open_llm_ws_adapter_sends_text_input_with_images() -> None:
         [
             {"type": "full-text", "text": "我看到了图片。"},
             {"type": "backend-synth-complete"},
+            {"type": "control", "text": "conversation-chain-end"},
         ]
     )
     adapter = OpenLlmWebSocketAdapter(
@@ -117,6 +120,29 @@ async def test_open_llm_ws_adapter_sends_text_input_with_images() -> None:
         "images": [image],
     }
     assert [segment.text for segment in result.segments] == ["我看到了图片。"]
+
+
+@pytest.mark.asyncio
+async def test_open_llm_ws_adapter_returns_on_conversation_chain_end_without_tts() -> None:
+    fake = FakeOpenLlmWebSocket(
+        [
+            {"type": "control", "text": "conversation-chain-start"},
+            {"type": "full-text", "text": "Thinking..."},
+            {"type": "full-text", "text": "纯文本回复。"},
+            {"type": "control", "text": "conversation-chain-end"},
+        ]
+    )
+    adapter = OpenLlmWebSocketAdapter(
+        "ws://example.test/client-ws",
+        connect=make_connect(fake),
+        receive_timeout_s=0.01,
+        initial_drain_timeout_s=0.01,
+    )
+
+    result = await adapter.start_text_turn("你好")
+
+    assert fake.sent == [{"type": "text-input", "text": "你好", "images": []}]
+    assert [segment.text for segment in result.segments] == ["纯文本回复。"]
 
 
 @pytest.mark.asyncio
@@ -151,6 +177,7 @@ async def test_open_llm_ws_adapter_reconnects_once_before_text_turn() -> None:
         [
             {"type": "full-text", "text": "我看到了图片。"},
             {"type": "backend-synth-complete"},
+            {"type": "control", "text": "conversation-chain-end"},
         ]
     )
     connected = []
@@ -196,6 +223,7 @@ async def test_open_llm_ws_adapter_maps_audio_display_text_without_audio_payload
                 "actions": {"expressions": ["happy"]},
             },
             {"type": "backend-synth-complete"},
+            {"type": "control", "text": "conversation-chain-end"},
         ]
     )
     adapter = OpenLlmWebSocketAdapter(
@@ -273,6 +301,7 @@ async def test_open_llm_ws_adapter_sends_audio_data_and_audio_end() -> None:
         [
             {"type": "full-text", "text": "我听到了。"},
             {"type": "backend-synth-complete"},
+            {"type": "control", "text": "conversation-chain-end"},
         ]
     )
     adapter = OpenLlmWebSocketAdapter(
@@ -317,6 +346,7 @@ async def test_open_llm_ws_adapter_uses_olv_vad_control_to_trigger_audio_turn() 
             {"type": "control", "text": "mic-audio-end"},
             {"type": "full-text", "text": "我听到了。"},
             {"type": "backend-synth-complete"},
+            {"type": "control", "text": "conversation-chain-end"},
         ]
     )
     adapter = OpenLlmWebSocketAdapter(
