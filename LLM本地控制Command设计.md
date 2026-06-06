@@ -310,7 +310,7 @@ reminded
   "command": "todo.manage",
   "args": {
     "action": "complete",
-    "todo_id": "todo_001"
+    "title": "xxx"
   }
 }
 ```
@@ -322,7 +322,7 @@ reminded
   "command": "todo.manage",
   "args": {
     "action": "delete",
-    "todo_id": "todo_001"
+    "title": "xxx"
   }
 }
 ```
