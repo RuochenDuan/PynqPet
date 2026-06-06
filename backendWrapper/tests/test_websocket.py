@@ -675,6 +675,104 @@ def test_text_input_with_pynq_command_block_sends_behavior_and_cleans_text(
     assert behavior["payload"]["args"] == {}
 
 
+def test_text_input_with_split_pynq_command_block_buffers_until_closed(
+    monkeypatch,
+) -> None:
+    from pynq_pet_gateway import websocket as websocket_module
+
+    class SplitCommandBlockAdapter:
+        async def start_text_turn(self, text: str):
+            return TextTurnResult(
+                segments=[
+                    TextSegment(text="让我看一下。\n<PYNQ_COMMANDS>"),
+                    TextSegment(text='[{"command":"camera.'),
+                    TextSegment(text='capture","args":{}}]\n</PYNQ_COMMANDS>'),
+                    TextSegment(text="拍照请求已经发出。"),
+                ]
+            )
+
+        async def interrupt_turn(self, turn_id: str, reason: str) -> None:
+            return None
+
+    monkeypatch.setattr(
+        websocket_module,
+        "create_upstream_adapter",
+        lambda: SplitCommandBlockAdapter(),
+    )
+
+    with client.websocket_connect("/api/v1/pet/ws") as websocket:
+        ready = init_session(websocket)
+
+        websocket.send_text(
+            envelope(
+                "text.input",
+                {"text": "你看看我是谁"},
+                request_id="req_split_command_block",
+                session_id=ready["session_id"],
+            )
+        )
+        events = receive_until_complete(websocket, limit=10)
+
+    text_payloads = [
+        event["payload"]["text"]
+        for event in events
+        if event["type"] == "response.text"
+    ]
+    behaviors = [event for event in events if event["type"] == "response.behavior"]
+    assert text_payloads == ["让我看一下。", "拍照请求已经发出。"]
+    assert len(behaviors) == 1
+    assert behaviors[0]["payload"]["command"] == "camera.capture"
+    assert behaviors[0]["payload"]["args"] == {}
+
+
+def test_text_input_with_unclosed_pynq_command_block_flushes_at_turn_end(
+    monkeypatch,
+) -> None:
+    from pynq_pet_gateway import websocket as websocket_module
+
+    class UnclosedCommandBlockAdapter:
+        async def start_text_turn(self, text: str):
+            return TextTurnResult(
+                segments=[
+                    TextSegment(text="我来看看。\n<PYNQ_COMMANDS>"),
+                    TextSegment(text='[{"command":"camera.capture","args":{}}]'),
+                ]
+            )
+
+        async def interrupt_turn(self, turn_id: str, reason: str) -> None:
+            return None
+
+    monkeypatch.setattr(
+        websocket_module,
+        "create_upstream_adapter",
+        lambda: UnclosedCommandBlockAdapter(),
+    )
+
+    with client.websocket_connect("/api/v1/pet/ws") as websocket:
+        ready = init_session(websocket)
+
+        websocket.send_text(
+            envelope(
+                "text.input",
+                {"text": "你看我拿的什么"},
+                request_id="req_unclosed_command_block",
+                session_id=ready["session_id"],
+            )
+        )
+        events = receive_until_complete(websocket, limit=9)
+
+    text_payloads = [
+        event["payload"]["text"]
+        for event in events
+        if event["type"] == "response.text"
+    ]
+    behaviors = [event for event in events if event["type"] == "response.behavior"]
+    assert text_payloads == ["我来看看。"]
+    assert len(behaviors) == 1
+    assert behaviors[0]["payload"]["command"] == "camera.capture"
+    assert behaviors[0]["payload"]["args"] == {}
+
+
 def test_text_input_with_multiple_pynq_commands_preserves_behavior_order(
     monkeypatch,
 ) -> None:

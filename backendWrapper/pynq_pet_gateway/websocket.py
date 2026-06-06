@@ -396,21 +396,23 @@ async def _handle_text_input(
         return
 
     session.transition_to(SessionState.RESPONDING)
+    segment_processor = ResponseSegmentProcessor(response_id)
     for segment in result.segments:
-        text, behavior_payloads = _response_segment_content(segment, response_id)
-        await websocket.send_json(
-            build_event(
-                "response.text",
-                {
-                    "response_id": response_id,
-                    "turn_id": turn_id,
-                    "text": text,
-                    "voice": segment.voice,
-                },
-                session_id=session.session_id,
-                request_id=envelope.request_id,
+        text, behavior_payloads = segment_processor.process(segment)
+        if text:
+            await websocket.send_json(
+                build_event(
+                    "response.text",
+                    {
+                        "response_id": response_id,
+                        "turn_id": turn_id,
+                        "text": text,
+                        "voice": segment.voice,
+                    },
+                    session_id=session.session_id,
+                    request_id=envelope.request_id,
+                )
             )
-        )
         for behavior_payload in behavior_payloads:
             await websocket.send_json(
                 build_event(
@@ -420,6 +422,15 @@ async def _handle_text_input(
                     request_id=envelope.request_id,
                 )
             )
+    for behavior_payload in segment_processor.flush():
+        await websocket.send_json(
+            build_event(
+                "response.behavior",
+                behavior_payload,
+                session_id=session.session_id,
+                request_id=envelope.request_id,
+            )
+        )
     session.transition_to(SessionState.WAITING_CLIENT_PLAYBACK)
     await websocket.send_json(
         build_event(
@@ -628,21 +639,23 @@ async def _send_turn_result(
     await _send_status(websocket, session, request_id, "thinking")
 
     session.transition_to(SessionState.RESPONDING)
+    segment_processor = ResponseSegmentProcessor(response_id)
     for segment in result.segments:
-        text, behavior_payloads = _response_segment_content(segment, response_id)
-        await websocket.send_json(
-            build_event(
-                "response.text",
-                {
-                    "response_id": response_id,
-                    "turn_id": turn_id,
-                    "text": text,
-                    "voice": segment.voice,
-                },
-                session_id=session.session_id,
-                request_id=request_id,
+        text, behavior_payloads = segment_processor.process(segment)
+        if text:
+            await websocket.send_json(
+                build_event(
+                    "response.text",
+                    {
+                        "response_id": response_id,
+                        "turn_id": turn_id,
+                        "text": text,
+                        "voice": segment.voice,
+                    },
+                    session_id=session.session_id,
+                    request_id=request_id,
+                )
             )
-        )
         for behavior_payload in behavior_payloads:
             await websocket.send_json(
                 build_event(
@@ -652,6 +665,15 @@ async def _send_turn_result(
                     request_id=request_id,
                 )
             )
+    for behavior_payload in segment_processor.flush():
+        await websocket.send_json(
+            build_event(
+                "response.behavior",
+                behavior_payload,
+                session_id=session.session_id,
+                request_id=request_id,
+            )
+        )
     session.transition_to(SessionState.WAITING_CLIENT_PLAYBACK)
     await websocket.send_json(
         build_event(
@@ -948,44 +970,87 @@ async def _close_upstream(upstream: UpstreamAdapter) -> None:
         await close()
 
 
-def _response_segment_content(segment: Any, response_id: str) -> tuple[str, list[dict[str, Any]]]:
-    text, command_payloads = _extract_pynq_command_blocks(segment.text, response_id)
-    text, tagged_expressions = _extract_expression_tags(text)
-    behavior_payloads = _behavior_payloads_from_actions(
-        segment.actions,
-        response_id,
-        extra_expressions=tagged_expressions,
-    )
-    behavior_payloads.extend(command_payloads)
-    return text, behavior_payloads
+@dataclass
+class ResponseSegmentProcessor:
+    response_id: str
+    command_buffer: str | None = None
+
+    def process(self, segment: Any) -> tuple[str, list[dict[str, Any]]]:
+        text, command_payloads = self._extract_pynq_command_blocks(segment.text)
+        text, tagged_expressions = _extract_expression_tags(text)
+        behavior_payloads = _behavior_payloads_from_actions(
+            segment.actions,
+            self.response_id,
+            extra_expressions=tagged_expressions,
+        )
+        behavior_payloads.extend(command_payloads)
+        return text, behavior_payloads
+
+    def _extract_pynq_command_blocks(self, text: str) -> tuple[str, list[dict[str, Any]]]:
+        payloads: list[dict[str, Any]] = []
+        output_parts: list[str] = []
+        remaining = text
+        saw_command_block = self.command_buffer is not None
+
+        while remaining:
+            if self.command_buffer is None:
+                start = remaining.find("<PYNQ_COMMANDS>")
+                if start < 0:
+                    output_parts.append(remaining)
+                    break
+                saw_command_block = True
+                output_parts.append(remaining[:start])
+                remaining = remaining[start + len("<PYNQ_COMMANDS>") :]
+                self.command_buffer = ""
+
+            end = remaining.find("</PYNQ_COMMANDS>")
+            if end < 0:
+                self.command_buffer += remaining
+                remaining = ""
+                break
+
+            self.command_buffer += remaining[:end]
+            payloads.extend(
+                _behavior_payloads_from_command_block(
+                    self.command_buffer,
+                    self.response_id,
+                )
+            )
+            self.command_buffer = None
+            remaining = remaining[end + len("</PYNQ_COMMANDS>") :]
+
+        cleaned = "".join(output_parts)
+        if saw_command_block:
+            cleaned = " ".join(cleaned.split())
+        return cleaned, payloads
+
+    def flush(self) -> list[dict[str, Any]]:
+        if self.command_buffer is None:
+            return []
+        payloads = _behavior_payloads_from_command_block(
+            self.command_buffer,
+            self.response_id,
+        )
+        self.command_buffer = None
+        return payloads
 
 
-def _extract_pynq_command_blocks(
-    text: str,
+def _behavior_payloads_from_command_block(
+    block: str,
     response_id: str,
-) -> tuple[str, list[dict[str, Any]]]:
-    if PYNQ_COMMAND_BLOCK_PATTERN.search(text) is None:
-        return text, []
-
+) -> list[dict[str, Any]]:
+    try:
+        commands = json.loads(block.strip())
+    except JSONDecodeError:
+        return []
+    if not isinstance(commands, list):
+        return []
     payloads: list[dict[str, Any]] = []
-
-    def replace_block(match: re.Match[str]) -> str:
-        block = match.group(1).strip()
-        try:
-            commands = json.loads(block)
-        except JSONDecodeError:
-            return ""
-        if not isinstance(commands, list):
-            return ""
-        for command in commands:
-            payload = _behavior_payload_from_command(command, response_id)
-            if payload is not None:
-                payloads.append(payload)
-        return ""
-
-    cleaned = PYNQ_COMMAND_BLOCK_PATTERN.sub(replace_block, text)
-    cleaned = " ".join(cleaned.split())
-    return cleaned, payloads
+    for command in commands:
+        payload = _behavior_payload_from_command(command, response_id)
+        if payload is not None:
+            payloads.append(payload)
+    return payloads
 
 
 def _extract_expression_tags(text: str) -> tuple[str, list[str]]:

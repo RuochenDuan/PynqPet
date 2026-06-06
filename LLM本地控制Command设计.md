@@ -119,31 +119,11 @@ args：
 | --- | --- | --- | --- |
 | `content_type` | string | 是 | 显示内容类型 |
 | `text` | string | 否 | 需要显示的文字 |
-| `expression` | string | 否 | 宠物表情 ID |
-| `duration_ms` | int | 否 | 显示持续时间，单位毫秒 |
 
 `content_type` 可选值建议：
 
 ```text
 text
-expression
-text_with_expression
-reminder
-error
-```
-
-`expression` 可选值建议：
-
-```text
-normal
-happy
-sad
-hungry
-sleepy
-thinking
-listening
-remind
-confused
 ```
 
 示例：
@@ -152,10 +132,8 @@ confused
 {
   "command": "oled.display",
   "args": {
-    "content_type": "text_with_expression",
-    "text": "主人，今天也要加油！",
-    "expression": "happy",
-    "duration_ms": 3000
+    "content_type": "text",
+    "text": "主人，今天也要加油！"
   }
 }
 ```
@@ -308,6 +286,19 @@ reminded
     "title": "明天上午交硬件课设报告",
     "remind_time": "2026-06-03 09:00",
     "status": "pending"
+  }
+}
+```
+
+更新任务示例：
+
+```json
+{
+  "command": "todo.manage",
+  "args": {
+    "action": "update",
+    "title": "后天上午交硬件课设报告",
+    "remind_time": "2026-06-04 09:00"
   }
 }
 ```
