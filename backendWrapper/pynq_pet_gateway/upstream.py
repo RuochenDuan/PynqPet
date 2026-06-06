@@ -94,21 +94,25 @@ class OpenLlmWebSocketAdapter:
         receive_timeout_s: float = 60.0,
         initial_drain_timeout_s: float = 0.2,
         audio_control_timeout_s: float = 0.05,
+        turn_settle_timeout_s: float = 5.0,
     ) -> None:
         self.ws_url = ws_url
         self._connect = connect or _default_connect
         self._receive_timeout_s = receive_timeout_s
         self._initial_drain_timeout_s = initial_drain_timeout_s
         self._audio_control_timeout_s = audio_control_timeout_s
+        self._turn_settle_timeout_s = turn_settle_timeout_s
         self.uses_upstream_vad = True
         self._websocket: Any | None = None
         self._pending_messages: list[dict[str, Any]] = []
+        self._settle_task: asyncio.Task[None] | None = None
 
     async def start_text_turn(
         self,
         text: str,
         images: list[dict[str, Any]] | None = None,
     ) -> TextTurnResult:
+        await self._wait_for_settle()
         websocket = await self._send_json_with_reconnect(
             {
                 "type": "text-input",
@@ -119,6 +123,7 @@ class OpenLlmWebSocketAdapter:
         return await self._collect_text_turn(websocket)
 
     async def start_audio_turn(self, audio_pcm: bytes) -> TextTurnResult:
+        await self._wait_for_settle()
         websocket = await self._ensure_websocket()
         await self._send_json(
             websocket,
@@ -131,6 +136,7 @@ class OpenLlmWebSocketAdapter:
         return await self._collect_text_turn(websocket)
 
     async def stream_audio_chunk(self, audio_pcm: bytes) -> AudioChunkResult:
+        await self._wait_for_settle()
         websocket = await self._ensure_websocket()
         await self._send_json(
             websocket,
@@ -163,10 +169,12 @@ class OpenLlmWebSocketAdapter:
         return AudioChunkResult()
 
     async def interrupt_turn(self, turn_id: str, reason: str) -> None:
+        await self._wait_for_settle()
         websocket = await self._ensure_websocket()
         await self._send_json(websocket, {"type": "interrupt-signal", "text": ""})
 
     async def close(self) -> None:
+        await self._wait_for_settle()
         websocket = self._websocket
         self._websocket = None
         self._pending_messages = []
@@ -241,6 +249,20 @@ class OpenLlmWebSocketAdapter:
             await self._send_json(websocket, payload)
             return websocket
 
+    async def _wait_for_settle(self) -> None:
+        task = self._settle_task
+        if task is None:
+            return
+        self._settle_task = None
+        try:
+            await task
+        except UpstreamBridgeError:
+            websocket = self._websocket
+            self._websocket = None
+            self._pending_messages = []
+            if websocket is not None:
+                await _close_websocket(websocket)
+
     async def _collect_text_turn(
         self,
         websocket: Any,
@@ -260,7 +282,8 @@ class OpenLlmWebSocketAdapter:
             message_type = message.get("type")
             if message_type == "backend-synth-complete":
                 await self._send_json(websocket, {"type": "frontend-playback-complete"})
-                continue
+                self._start_settle_task(websocket)
+                return TextTurnResult(segments=segments)
             if (
                 message_type == "control"
                 and message.get("text") == CONVERSATION_CHAIN_END
@@ -279,6 +302,34 @@ class OpenLlmWebSocketAdapter:
             segment = _normalize_text_segment(message)
             if segment is not None:
                 segments.append(segment)
+
+    def _start_settle_task(self, websocket: Any) -> None:
+        if self._settle_task is not None and not self._settle_task.done():
+            return
+        self._settle_task = asyncio.create_task(self._drain_until_conversation_end(websocket))
+
+    async def _drain_until_conversation_end(self, websocket: Any) -> None:
+        while True:
+            try:
+                message = await self._read_next_message(
+                    websocket,
+                    timeout=self._turn_settle_timeout_s,
+                )
+            except TimeoutError as exc:
+                raise UpstreamBridgeError(
+                    "Timed out waiting for Open-LLM conversation-chain-end"
+                ) from exc
+            message_type = message.get("type")
+            if (
+                message_type == "control"
+                and message.get("text") == CONVERSATION_CHAIN_END
+            ):
+                return
+            if message_type == "backend-synth-complete":
+                await self._send_json(websocket, {"type": "frontend-playback-complete"})
+                continue
+            if message_type == "error":
+                raise UpstreamBridgeError(str(message.get("message") or "Open-LLM error"))
 
 
 async def _default_connect(ws_url: str) -> Any:

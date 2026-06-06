@@ -85,6 +85,7 @@ async def test_open_llm_ws_adapter_sends_text_input_and_normalizes_full_text() -
     assert fake.sent[1] == {"type": "frontend-playback-complete"}
     assert [segment.text for segment in result.segments] == ["你好，我在。"]
     assert fake.closed is False
+    await wait_until(lambda: fake.messages == [])
 
     await adapter.close()
 
@@ -120,6 +121,7 @@ async def test_open_llm_ws_adapter_sends_text_input_with_images() -> None:
         "images": [image],
     }
     assert [segment.text for segment in result.segments] == ["我看到了图片。"]
+    await wait_until(lambda: fake.messages == [])
 
 
 @pytest.mark.asyncio
@@ -143,6 +145,65 @@ async def test_open_llm_ws_adapter_returns_on_conversation_chain_end_without_tts
 
     assert fake.sent == [{"type": "text-input", "text": "你好", "images": []}]
     assert [segment.text for segment in result.segments] == ["纯文本回复。"]
+
+
+@pytest.mark.asyncio
+async def test_open_llm_ws_adapter_returns_before_conversation_chain_end() -> None:
+    fake = FakeOpenLlmWebSocket(
+        [
+            {"type": "full-text", "text": "先回复。"},
+            {"type": "backend-synth-complete"},
+            {"type": "force-new-message"},
+            {"type": "control", "text": "conversation-chain-end"},
+        ]
+    )
+    adapter = OpenLlmWebSocketAdapter(
+        "ws://example.test/client-ws",
+        connect=make_connect(fake),
+        receive_timeout_s=0.01,
+        initial_drain_timeout_s=0.01,
+        turn_settle_timeout_s=0.01,
+    )
+
+    result = await adapter.start_text_turn("你好")
+
+    assert [segment.text for segment in result.segments] == ["先回复。"]
+    assert fake.sent == [
+        {"type": "text-input", "text": "你好", "images": []},
+        {"type": "frontend-playback-complete"},
+    ]
+    await wait_until(lambda: fake.messages == [])
+
+
+@pytest.mark.asyncio
+async def test_open_llm_ws_adapter_waits_for_previous_turn_before_next_text() -> None:
+    fake = FakeOpenLlmWebSocket(
+        [
+            {"type": "full-text", "text": "第一轮。"},
+            {"type": "backend-synth-complete"},
+            {"type": "control", "text": "conversation-chain-end"},
+            {"type": "full-text", "text": "第二轮。"},
+            {"type": "backend-synth-complete"},
+            {"type": "control", "text": "conversation-chain-end"},
+        ]
+    )
+    adapter = OpenLlmWebSocketAdapter(
+        "ws://example.test/client-ws",
+        connect=make_connect(fake),
+        receive_timeout_s=0.01,
+        initial_drain_timeout_s=0.01,
+        turn_settle_timeout_s=0.01,
+    )
+
+    first = await adapter.start_text_turn("第一")
+    second = await adapter.start_text_turn("第二")
+
+    assert [segment.text for segment in first.segments] == ["第一轮。"]
+    assert [segment.text for segment in second.segments] == ["第二轮。"]
+    assert [message["text"] for message in fake.sent if message["type"] == "text-input"] == [
+        "第一",
+        "第二",
+    ]
 
 
 @pytest.mark.asyncio
