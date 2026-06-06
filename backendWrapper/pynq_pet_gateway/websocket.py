@@ -330,10 +330,10 @@ async def _handle_session_init(
                 "device_id": session.device_id,
                 "config_id": config_id,
                 "server_capabilities": {
-                    "vad": False,
-                    "asr": False,
+                    "vad": True,
+                    "asr": True,
                     "vision_context": True,
-                    "behavior_planning": False,
+                    "behavior_planning": True,
                 },
             },
             session_id=session.session_id,
