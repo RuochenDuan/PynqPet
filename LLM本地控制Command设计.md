@@ -42,7 +42,6 @@ LLM 下发本地控制指令时，统一使用以下结构：
 ui.switch_screen
 oled.display
 camera.capture
-tts.speak
 time.speak_current
 environment.speak_current
 todo.manage
