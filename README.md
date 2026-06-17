@@ -1,19 +1,24 @@
-# AGENTS MUST READ
-
-- You must obey [接口说明](./接口说明.md) before developing either the server or the client.
-
-- Name the git branch as `feature/xxx` for adding new function.
-
-- DON'T USE REBASE FOR MERGING. PR IS RECOMMENDED.
-
-- Open files in utf-8.
-
-- Don't delete any annotation.
-
----
+<h1 align="center">PynqPet</h1>
 
 ## 仓库结构
 
 - `backendWrapper`: 服务端代码
-- `vivado_files`: 工程相关文件
+- `vivado_files`: 硬件工程相关文件
 - vitis 工程同步形式待定
+
+
+## 声明
+
+本项目基于 [Open-LLM-Vtuber](https://github.com/Open-LLM-VTuber/Open-LLM-VTuber) 二次开发，修改内容包括：
+- `Open-LLM-VTuber/src/open_llm_vtuber/tts/siliconflow_tts.py`: 注释[第30-66行](https://github.com/Open-LLM-VTuber/Open-LLM-VTuber/blob/main/src/open_llm_vtuber/tts/siliconflow_tts.py#L30)，在结尾添加`return ""`
+- `Open-LLM-VTuber/prompts/utils/`: 新增[pynq_command_prompt.txt](attachments/pynq_command_prompt.txt)
+
+## Third-Party Licenses
+
+### Live2D Sample Models Notice
+
+This project includes Live2D sample models provided by Live2D Inc. These assets are licensed separately under the Live2D Free Material License Agreement and the Terms of Use for Live2D Cubism Sample Data. They are not covered by the MIT license of this project.
+
+This content uses sample data owned and copyrighted by Live2D Inc. The sample data are utilized in accordance with the terms and conditions set by Live2D Inc. (See [Live2D Free Material License Agreement](https://www.live2d.jp/en/terms/live2d-free-material-license-agreement/) and [Terms of Use](https://www.live2d.com/eula/live2d-sample-model-terms_en.html)).
+
+Note: For commercial use, especially by medium or large-scale enterprises, the use of these Live2D sample models may be subject to additional licensing requirements. If you plan to use this project commercially, please ensure that you have the appropriate permissions from Live2D Inc., or use versions of the project without these models.
