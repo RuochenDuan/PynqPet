@@ -12,6 +12,9 @@
 本项目基于 [Open-LLM-Vtuber](https://github.com/Open-LLM-VTuber/Open-LLM-VTuber) 二次开发，修改内容包括：
 - `Open-LLM-VTuber/src/open_llm_vtuber/tts/siliconflow_tts.py`: 注释[第30-66行](https://github.com/Open-LLM-VTuber/Open-LLM-VTuber/blob/main/src/open_llm_vtuber/tts/siliconflow_tts.py#L30)，在结尾添加`return ""`
 - `Open-LLM-VTuber/prompts/utils/`: 新增[pynq_command_prompt.txt](attachments/pynq_command_prompt.txt)
+- `backendWrapper/`: 新增的目录
+
+修改的部分同样遵循原[LICENSE](LICENSE)
 
 ## Third-Party Licenses
 
