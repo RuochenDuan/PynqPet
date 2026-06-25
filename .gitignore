@@ -1,7 +1,3 @@
-##### 不要上传完整 vitis 或 vivado 目录 #####
-##### vivado仅同步 *.bd, *.xdc, *xsa
-##### vitis仅同步 src/
-
 # ide configs
 .vscode/
 .idea/
@@ -24,15 +20,6 @@ logs/
 __pycache__/
 *.py[cod]
 .uv-cache/
-
-# agent configs
-claude.md
-AGENT.md
-.ai/
-.copilot/
-.gemini/
-.cursor/
-.trae/
 
 # system
 .DS_Store/
