@@ -1,10 +1,26 @@
 <h1 align="center">PynqPet</h1>
 
+![body](./figs/body.jpg)
+![screen](./figs/screen.jpg)
+
+## 硬件清单
+
+- Pynq-Z1
+- ESP32-C3-SuperMini
+- SSD1309
+- UNR3/Meg2560 兼容震动马达
+- 4*4 键盘
+- OV7670
+- DS3231RTC
+- DHT11
+- XFS5152
+- INMP441
+
 ## 仓库结构
 
-- `backendWrapper`: 服务端代码
-- `vivado_files`: 硬件工程相关文件
-- vitis 工程同步形式待定
+- `backendWrapper`: 服务端
+- `vivado_files`: 硬件工程
+- `vitis_files`: 客户端
 
 
 ## 声明
