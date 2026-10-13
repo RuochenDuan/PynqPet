@@ -1,0 +1,49 @@
+* text=auto eol=lf
+
+*.py       text
+*.c        text
+*.h        text
+*.v        text
+*.sv       text
+*.vhd      text
+*.vhdl     text
+*.md       text
+*.txt      text
+*.toml     text
+*.yaml     text
+*.yml      text
+*.json     text
+*.lock     text
+LICENSE    text
+.gitignore text
+.gitattributes text
+
+*.tcl      text
+*.xdc      text
+*.bd       text
+*.xpr      text
+*.xci      text
+*.xml      text
+*.hwh      text
+*.mdd      text
+Makefile   text
+
+*.bat      text eol=crlf
+*.cmd      text eol=crlf
+*.ps1      text eol=lf
+*.sh       text eol=lf
+
+*.xsa      binary
+*.bit      binary
+*.bin      binary
+*.elf      binary
+*.o        binary
+*.a        binary
+*.dcp      binary
+
+*.png      binary
+*.jpg      binary
+*.jpeg     binary
+*.pcm      binary
+*.zip      binary
+*.pdf      binary

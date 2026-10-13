@@ -1,0 +1,24 @@
+# editor configs
+.vscode/
+.idea/
+
+# local
+*.obj
+*.pdb
+*.ilk
+*.o
+*.d
+/build/
+.tmp/
+
+# logs
+logs/
+.log
+**/Debug/
+
+# caches
+__pycache__/
+.uv-cache/
+
+# system
+.DS_Store/
