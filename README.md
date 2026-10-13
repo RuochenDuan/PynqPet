@@ -37,7 +37,7 @@ A reactive table pet driven by LLMs.
                                  | WebSocket
                                  v
                        +------------------+
-                       |  BackendWrapper  |
+                       |  backendWrapper  |
                        +---------+--------+
                                  ^
                                  | WebSocket
@@ -52,7 +52,7 @@ A reactive table pet driven by LLMs.
 
 This project uses [Open-LLM-VTuber](https://github.com/Open-LLM-VTuber/Open-LLM-VTuber) as an upstream service. Deploy it first and enable [cmd_prompt](docs/cmd_prompt.txt) for it.
 
-`BackendWrapper` use `uv` to manage dependencies too.
+`backendWrapper` use `uv` to manage dependencies too.
 
 ### Client
 
@@ -66,7 +66,7 @@ Power on the client first and run:
 cd /path/to/Open-LLM-VTuber
 uv run run_server.py
 
-cd /path/to/BackendWrapper
+cd /path/to/backendWrapper
 export PYNQ_PET_UPSTREAM_MODE = 'open_llm_ws'
 export PYNQ_PET_OPEN_LLM_WS_URL = 'ws://127.0.0.1:12393/client-ws'
 uv run uvicorn main:app --host 0.0.0.0 --port 8000
